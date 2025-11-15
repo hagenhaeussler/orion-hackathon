@@ -28,6 +28,13 @@
   color: #cccccc;
 }
 
+.content-container {
+  flex: 1;
+  display: flex;
+  gap: 1rem;
+  overflow: hidden;
+}
+
 .map-container {
   flex: 1;
   overflow: hidden;
@@ -62,5 +69,64 @@
   text-align: center;
   color: #aaaaaa;
   font-size: 0.85rem;
+}
+
+.command-panel {
+  width: 250px;
+  background: #2a2a2a;
+  border-left: 2px solid #3a3a3a;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.command-panel h3 {
+  margin: 0;
+  font-size: 1.1rem;
+  color: #00ff88;
+  font-weight: 600;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #3a3a3a;
+}
+
+.command-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.command-button {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: #1a1a1a;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  color: #cccccc;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.command-button:hover {
+  background: #333333;
+  border-color: #00aaff;
+  transform: translateY(-1px);
+}
+
+.command-button:active {
+  transform: translateY(0);
+}
+
+.command-icon {
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.command-text {
+  flex: 1;
+  text-align: left;
 }
 

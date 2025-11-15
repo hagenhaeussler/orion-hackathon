@@ -10,6 +10,7 @@ function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState(null)
   const [dragEnd, setDragEnd] = useState(null)
+  const [showCommandPanel, setShowCommandPanel] = useState(false)
   const svgRef = useRef(null)
   const worldWidth = 1000
   const worldHeight = 1000
@@ -74,6 +75,7 @@ function App() {
   // Handle click on drone (toggle selection)
   const handleDroneClick = useCallback((e, droneId) => {
     e.stopPropagation()
+    setShowCommandPanel(false) // Hide command panel when selecting different drone
     setSelectedDrones(prev => {
       const next = new Set(prev)
       if (next.has(droneId)) {
@@ -84,6 +86,44 @@ function App() {
       return next
     })
   }, [])
+
+  // Handle right-click on drone (show command menu)
+  const handleDroneRightClick = useCallback((e, droneId) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    // Only show command panel if drone is selected
+    if (selectedDrones.has(droneId)) {
+      setShowCommandPanel(true)
+    }
+  }, [selectedDrones])
+
+  // Handle hold position command
+  const handleHoldPosition = useCallback(async () => {
+    if (selectedDrones.size === 0) return
+
+    try {
+      // For each selected drone, get its current position and set it as target
+      const droneList = drones.filter(d => selectedDrones.has(d.id))
+
+      // Send command to stop each drone at its current position
+      for (const drone of droneList) {
+        await fetch(`${API_BASE}/command`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            drone_ids: [drone.id],
+            target_x: drone.x,
+            target_y: drone.y
+          })
+        })
+      }
+    } catch (error) {
+      console.error('Error sending hold position command:', error)
+    }
+  }, [selectedDrones, drones])
 
   // Selection box drag handlers
   const handleMouseDown = useCallback((e) => {
@@ -157,6 +197,7 @@ function App() {
           <span>Selected: {selectedDrones.size}</span>
         </div>
       </div>
+      <div className="content-container">
       <div className="map-container">
         <svg
           ref={svgRef}
@@ -195,6 +236,7 @@ function App() {
               <g
                 key={drone.id}
                 onClick={(e) => handleDroneClick(e, drone.id)}
+                onContextMenu={(e) => handleDroneRightClick(e, drone.id)}
                 style={{ cursor: 'pointer' }}
               >
                 {/* Drone circle */}
@@ -248,8 +290,23 @@ function App() {
           })}
         </svg>
       </div>
+
+      {/* Command Panel */}
+      {showCommandPanel && (
+        <div className="command-panel">
+          <h3>Drone Commands</h3>
+          <div className="command-list">
+            <button className="command-button" onClick={handleHoldPosition}>
+              <span className="command-icon">🛑</span>
+              <span className="command-text">Hold Position</span>
+            </button>
+          </div>
+        </div>
+      )}
+      </div>
+
       <div className="instructions">
-        <p>Click and drag to select drones • Click on map to move selected drones</p>
+        <p>Click and drag to select drones • Click on map to move selected drones • Right-click selected drone for commands</p>
       </div>
     </div>
   )
