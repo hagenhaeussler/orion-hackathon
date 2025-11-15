@@ -303,12 +303,13 @@ function App() {
                   strokeWidth={isSelected ? 3 : 2}
                   className="drone"
                 />
-                {/* Drone ID label (only for friendly drones) */}
+                {/* Drone ID label (only for friendly drones) - centered on circle */}
                 {isFriendly && (
                   <text
                     x={drone.x}
-                    y={drone.y - 18}
+                    y={drone.y}
                     textAnchor="middle"
+                    dominantBaseline="central"
                     fill="#ffffff"
                     fontSize="10"
                     fontWeight="bold"

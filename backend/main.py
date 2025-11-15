@@ -27,7 +27,7 @@ class Drone(BaseModel):
     y: float
     vx: float = 0.0
     vy: float = 0.0
-    mode: str = "idle"  # idle, moving, pattern
+    mode: str = "idle"  # idle, moving, dispersing, pattern
     target_x: Optional[float] = None
     target_y: Optional[float] = None
     team: str = "friendly"  # friendly or enemy
@@ -36,6 +36,7 @@ class Drone(BaseModel):
     last_x: Optional[float] = None  # Previous position for stuck detection
     last_y: Optional[float] = None
     stuck_frames: int = 0  # Number of frames without movement
+    command_id: Optional[int] = None  # ID of the command group this drone belongs to
 
 class WorldState(BaseModel):
     drones: List[Drone]
@@ -49,11 +50,12 @@ class Command(BaseModel):
 # In-memory world state
 world = {
     "drones": {},
-    "last_update": datetime.now().timestamp()
+    "last_update": datetime.now().timestamp(),
+    "next_command_id": 1  # Counter for command groups
 }
 
 # Simulation parameters
-DRONE_SPEED = 50.0  # pixels per second
+DRONE_SPEED = 100.0  # pixels per second (increased for faster movement)
 ENEMY_SPEED = 40.0  # pixels per second for enemy drones
 WORLD_WIDTH = 1000
 WORLD_HEIGHT = 1000
@@ -64,8 +66,7 @@ DRONE_STROKE_WIDTH = 3.0  # Maximum stroke width (selected drones have strokeWid
 # But we'll use radius + strokeWidth to ensure we catch all collisions including the full stroke
 DRONE_HITBOX_RADIUS = DRONE_VISUAL_RADIUS + (DRONE_STROKE_WIDTH / 2.0)  # Total hitbox includes outer stroke edge
 DRONE_RADIUS = DRONE_HITBOX_RADIUS  # Use hitbox radius for collision detection
-SEPARATION_DISTANCE = DRONE_HITBOX_RADIUS * 2.2  # Minimum distance between friendly drones (slightly more than touching)
-SEPARATION_FORCE = 300.0  # Force applied for separation (increased for better separation)
+GRID_SPACING = DRONE_VISUAL_RADIUS * 2.0  # Spacing between drones in grid (minimal buffer)
 STUCK_THRESHOLD = 0.5  # Movement threshold to consider drone as having moved (pixels)
 STUCK_FRAMES_TO_ARRIVE = 5  # Number of frames without movement to consider "arrived"
 
@@ -89,10 +90,7 @@ def init_drones():
             vx=0.0,
             vy=0.0,
             mode="idle",
-            team="friendly",
-            last_x=start_x + col * spacing,
-            last_y=start_y + row * spacing,
-            stuck_frames=0
+            team="friendly"
         )
     
     # Initialize enemy drones with different patterns
@@ -209,51 +207,69 @@ def update_enemy_pattern(drone: Drone, dt: float) -> Drone:
     
     return drone
 
-def would_collide(drone: Drone, new_x: float, new_y: float, other_drones: List[Drone]) -> bool:
-    """Check if moving to new position would cause a collision with another friendly drone."""
-    for other in other_drones:
-        if other.id == drone.id or other.team != "friendly":
-            continue
-        
-        # Check distance to other drone's current position
-        dx = new_x - other.x
-        dy = new_y - other.y
-        distance = math.sqrt(dx * dx + dy * dy)
-        
-        if distance < DRONE_HITBOX_RADIUS * 2:
-            return True
+def calculate_grid_positions(num_drones: int, center_x: float, center_y: float) -> List[tuple]:
+    """Calculate grid positions for drones in a square pattern centered around a point."""
+    if num_drones == 0:
+        return []
     
-    return False
+    # Calculate grid dimensions (square as much as possible)
+    cols = int(math.ceil(math.sqrt(num_drones)))
+    rows = int(math.ceil(num_drones / cols))
+    
+    positions = []
+    spacing = GRID_SPACING
+    
+    # Calculate starting position (top-left of grid)
+    total_width = (cols - 1) * spacing
+    total_height = (rows - 1) * spacing
+    start_x = center_x - total_width / 2.0
+    start_y = center_y - total_height / 2.0
+    
+    # Generate positions in row-major order
+    for i in range(num_drones):
+        row = i // cols
+        col = i % cols
+        x = start_x + col * spacing
+        y = start_y + row * spacing
+        positions.append((x, y))
+    
+    return positions
 
-def calculate_safe_movement(drone: Drone, desired_vx: float, desired_vy: float, dt: float, all_drones: List[Drone]) -> tuple:
-    """Calculate safe movement that won't cause collisions. Returns (vx, vy, moved)."""
-    new_x = drone.x + desired_vx * dt
-    new_y = drone.y + desired_vy * dt
+def all_group_drones_arrived(command_id: int, all_drones: List[Drone]) -> bool:
+    """Check if all drones in a command group have arrived at the destination."""
+    group_drones = [d for d in all_drones if d.command_id == command_id and d.mode == "moving"]
     
-    # Check if this movement would cause a collision
-    if would_collide(drone, new_x, new_y, all_drones):
-        # Try reducing movement by 50%
-        reduced_vx = desired_vx * 0.5
-        reduced_vy = desired_vy * 0.5
-        new_x = drone.x + reduced_vx * dt
-        new_y = drone.y + reduced_vy * dt
-        
-        if would_collide(drone, new_x, new_y, all_drones):
-            # Still would collide, try even smaller movement
-            reduced_vx = desired_vx * 0.25
-            reduced_vy = desired_vy * 0.25
-            new_x = drone.x + reduced_vx * dt
-            new_y = drone.y + reduced_vy * dt
-            
-            if would_collide(drone, new_x, new_y, all_drones):
-                # Would still collide, don't move at all
-                return (0.0, 0.0, False)
-            else:
-                return (reduced_vx, reduced_vy, True)
-        else:
-            return (reduced_vx, reduced_vy, True)
-    else:
-        return (desired_vx, desired_vy, True)
+    if len(group_drones) == 0:
+        return True  # No moving drones in group
+    
+    # Check if all drones are close to their target
+    for drone in group_drones:
+        if drone.target_x is None or drone.target_y is None:
+            continue
+        dx = drone.target_x - drone.x
+        dy = drone.target_y - drone.y
+        distance = math.sqrt(dx * dx + dy * dy)
+        if distance > 5.0:  # Not close enough yet
+            return False
+    
+    return True
+
+def disperse_group(command_id: int, all_drones: List[Drone], target_x: float, target_y: float):
+    """Disperse a group of drones into a square grid around the target."""
+    group_drones = [d for d in all_drones if d.command_id == command_id and d.team == "friendly"]
+    
+    if len(group_drones) == 0:
+        return
+    
+    # Calculate grid positions
+    grid_positions = calculate_grid_positions(len(group_drones), target_x, target_y)
+    
+    # Assign grid positions to drones
+    for i, drone in enumerate(group_drones):
+        if i < len(grid_positions):
+            drone.target_x = grid_positions[i][0]
+            drone.target_y = grid_positions[i][1]
+            drone.mode = "dispersing"
 
 def update_drone(drone: Drone, dt: float, all_drones: List[Drone]) -> Drone:
     """Update drone position based on current velocity and target."""
@@ -261,50 +277,32 @@ def update_drone(drone: Drone, dt: float, all_drones: List[Drone]) -> Drone:
     if drone.team == "enemy" and drone.mode == "pattern":
         return update_enemy_pattern(drone, dt)
     
-    # Handle friendly drone movement with predictive collision avoidance
+    # Handle friendly drone movement (simple, no collision avoidance)
     if drone.team == "friendly":
-        # Initialize position tracking
-        if drone.last_x is None:
-            drone.last_x = drone.x
-            drone.last_y = drone.y
-        
-        old_x = drone.x
-        old_y = drone.y
-        
         if drone.mode == "moving" and drone.target_x is not None and drone.target_y is not None:
-            # Calculate distance to target
+            # Simple movement toward target (can overlap)
             dx = drone.target_x - drone.x
             dy = drone.target_y - drone.y
             distance = math.sqrt(dx * dx + dy * dy)
             
-            # Check if drone has been stuck (not moving) for several frames
-            movement = math.sqrt((drone.x - drone.last_x) ** 2 + (drone.y - drone.last_y) ** 2)
-            if movement < STUCK_THRESHOLD:
-                drone.stuck_frames += 1
-            else:
-                drone.stuck_frames = 0
-            
-            # Consider arrived if stuck for enough frames (blocked by other drones)
-            if drone.stuck_frames >= STUCK_FRAMES_TO_ARRIVE:
-                # Drone is blocked, consider it arrived
-                drone.vx = 0.0
-                drone.vy = 0.0
-                drone.mode = "idle"
-                drone.target_x = None
-                drone.target_y = None
-                drone.stuck_frames = 0
-            elif distance < 5.0:  # Close enough to target
-                # Arrived at target
+            if distance < 5.0:  # Close enough to target
+                # Arrived at target - snap to it
                 drone.x = drone.target_x
                 drone.y = drone.target_y
                 drone.vx = 0.0
                 drone.vy = 0.0
-                drone.mode = "idle"
-                drone.target_x = None
-                drone.target_y = None
-                drone.stuck_frames = 0
+                
+                # Check if all drones in group have arrived
+                if drone.command_id is not None:
+                    if all_group_drones_arrived(drone.command_id, all_drones):
+                        # All arrived - trigger dispersion
+                        disperse_group(drone.command_id, all_drones, drone.target_x, drone.target_y)
+                        # This drone will be set to dispersing mode by disperse_group
+                        return drone
+                
+                # Not all arrived yet, stay in moving mode
             else:
-                # Calculate desired direction to target
+                # Move toward target
                 if distance > 0:
                     direction_x = dx / distance
                     direction_y = dy / distance
@@ -312,37 +310,56 @@ def update_drone(drone: Drone, dt: float, all_drones: List[Drone]) -> Drone:
                     direction_x = 0
                     direction_y = 0
                 
-                # Desired velocity toward target
-                target_vx = direction_x * DRONE_SPEED
-                target_vy = direction_y * DRONE_SPEED
+                drone.vx = direction_x * DRONE_SPEED
+                drone.vy = direction_y * DRONE_SPEED
                 
-                # Calculate safe movement that won't cause collisions
-                safe_vx, safe_vy, moved = calculate_safe_movement(drone, target_vx, target_vy, dt, all_drones)
+                # Update position
+                drone.x += drone.vx * dt
+                drone.y += drone.vy * dt
                 
-                drone.vx = safe_vx
-                drone.vy = safe_vy
-                
-                if moved:
-                    # Update position
-                    drone.x += drone.vx * dt
-                    drone.y += drone.vy * dt
-                    
-                    # Clamp to world bounds
-                    drone.x = max(0, min(WORLD_WIDTH, drone.x))
-                    drone.y = max(0, min(WORLD_HEIGHT, drone.y))
+                # Clamp to world bounds
+                drone.x = max(0, min(WORLD_WIDTH, drone.x))
+                drone.y = max(0, min(WORLD_HEIGHT, drone.y))
+        
+        elif drone.mode == "dispersing" and drone.target_x is not None and drone.target_y is not None:
+            # Moving to grid position
+            dx = drone.target_x - drone.x
+            dy = drone.target_y - drone.y
+            distance = math.sqrt(dx * dx + dy * dy)
+            
+            if distance < 2.0:  # Arrived at grid position
+                drone.x = drone.target_x
+                drone.y = drone.target_y
+                drone.vx = 0.0
+                drone.vy = 0.0
+                drone.mode = "idle"
+                drone.target_x = None
+                drone.target_y = None
+                drone.command_id = None
+            else:
+                # Move toward grid position
+                if distance > 0:
+                    direction_x = dx / distance
+                    direction_y = dy / distance
                 else:
-                    # Can't move due to collision risk
-                    drone.vx = 0.0
-                    drone.vy = 0.0
+                    direction_x = 0
+                    direction_y = 0
+                
+                drone.vx = direction_x * DRONE_SPEED
+                drone.vy = direction_y * DRONE_SPEED
+                
+                # Update position
+                drone.x += drone.vx * dt
+                drone.y += drone.vy * dt
+                
+                # Clamp to world bounds
+                drone.x = max(0, min(WORLD_WIDTH, drone.x))
+                drone.y = max(0, min(WORLD_HEIGHT, drone.y))
+        
         else:
             # Idle - no movement
             drone.vx = 0.0
             drone.vy = 0.0
-            drone.stuck_frames = 0
-        
-        # Update position tracking
-        drone.last_x = old_x
-        drone.last_y = old_y
     
     return drone
 
@@ -419,6 +436,10 @@ async def get_world():
 @app.post("/command")
 async def send_command(command: Command):
     """Send a command to move selected drones to a target location."""
+    # Assign the same command_id to all drones in this command
+    command_id = world["next_command_id"]
+    world["next_command_id"] += 1
+    
     updated_count = 0
     for drone_id in command.drone_ids:
         if drone_id in world["drones"]:
@@ -428,6 +449,8 @@ async def send_command(command: Command):
                 drone.target_x = command.target_x
                 drone.target_y = command.target_y
                 drone.mode = "moving"
+                drone.command_id = command_id  # Assign group ID
+                drone.stuck_frames = 0  # Reset stuck counter for new command
                 world["drones"][drone_id] = drone
                 updated_count += 1
     
