@@ -32,10 +32,13 @@ python start.py
 ```
 
 This will:
-1. Check and install dependencies automatically
-2. Start the backend server on `http://localhost:8000`
-3. Start the frontend server on `http://localhost:5173`
-4. Open your browser to `http://localhost:5173`
+1. Create a Python virtual environment (isolated from your system Python/conda)
+2. Install Python dependencies in the virtual environment
+3. Install Node.js dependencies in `frontend/node_modules`
+4. Start the backend server on `http://localhost:8000`
+5. Start the frontend server on `http://localhost:5173`
+
+**Note:** Dependencies are installed in a project-local virtual environment (`venv/`) and won't affect your system Python or conda environment.
 
 The script works on both **Mac** and **Windows**.
 

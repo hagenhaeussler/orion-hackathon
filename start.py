@@ -14,6 +14,30 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 BACKEND_DIR = PROJECT_ROOT / "backend"
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
+VENV_DIR = PROJECT_ROOT / "venv"
+
+def get_venv_python():
+    """Get the Python executable from the virtual environment."""
+    if sys.platform == "win32":
+        return VENV_DIR / "Scripts" / "python.exe"
+    else:
+        return VENV_DIR / "bin" / "python"
+
+def setup_venv():
+    """Create and setup a virtual environment if it doesn't exist."""
+    venv_python = get_venv_python()
+    
+    if not VENV_DIR.exists():
+        print("Creating virtual environment...")
+        subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
+        print("✓ Virtual environment created")
+    
+    # Install/upgrade pip in venv
+    print("Setting up virtual environment...")
+    subprocess.run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], 
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    return venv_python
 
 def check_dependencies():
     """Check if required dependencies are installed."""
@@ -24,13 +48,22 @@ def check_dependencies():
         print("ERROR: Python 3.8 or higher is required")
         sys.exit(1)
     
-    # Check if backend dependencies are installed
+    # Setup virtual environment
+    venv_python = setup_venv()
+    
+    # Check if backend dependencies are installed in venv
     try:
-        import fastapi
-        import uvicorn
-    except ImportError:
-        print("Installing backend dependencies...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(BACKEND_DIR / "requirements.txt")], check=True)
+        result = subprocess.run(
+            [str(venv_python), "-c", "import fastapi; import uvicorn"],
+            capture_output=True,
+            check=True
+        )
+    except subprocess.CalledProcessError:
+        print("Installing backend dependencies in virtual environment...")
+        subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "-r", str(BACKEND_DIR / "requirements.txt")],
+            check=True
+        )
     
     # Check if Node.js is installed
     try:
@@ -44,17 +77,19 @@ def check_dependencies():
         print("Installing frontend dependencies...")
         subprocess.run(["npm", "install"], cwd=FRONTEND_DIR, check=True)
     
-    print("✓ All dependencies are ready\n")
+    print("✓ All dependencies are ready")
+    print(f"✓ Using virtual environment: {VENV_DIR}\n")
 
 def start_servers():
     """Start both backend and frontend servers."""
     processes = []
+    venv_python = get_venv_python()
     
     try:
         # Start backend
         print("Starting backend server on http://localhost:8000...")
         backend_process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
+            [str(venv_python), "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
             cwd=BACKEND_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
