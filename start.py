@@ -32,11 +32,7 @@ def setup_venv():
         subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
         print("✓ Virtual environment created")
     
-    # Install/upgrade pip in venv
-    print("Setting up virtual environment...")
-    subprocess.run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], 
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
+    # Skip pip upgrade - not necessary and slows things down
     return venv_python
 
 def check_dependencies():
@@ -80,16 +76,31 @@ def check_dependencies():
     print("✓ All dependencies are ready")
     print(f"✓ Using virtual environment: {VENV_DIR}\n")
 
+def wait_for_server(url, timeout=10):
+    """Wait for a server to be ready by checking its endpoint."""
+    import urllib.request
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            urllib.request.urlopen(url, timeout=0.5)
+            return True
+        except:
+            time.sleep(0.2)
+    return False
+
 def start_servers():
     """Start both backend and frontend servers."""
     processes = []
     venv_python = get_venv_python()
     
     try:
-        # Start backend
-        print("Starting backend server on http://localhost:8000...")
+        # Start both servers in parallel
+        print("Starting servers...")
+        print("  Backend:  http://localhost:8000")
+        print("  Frontend: http://localhost:5173")
+        
         backend_process = subprocess.Popen(
-            [str(venv_python), "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
+            [str(venv_python), "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"],
             cwd=BACKEND_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -97,11 +108,6 @@ def start_servers():
         )
         processes.append(backend_process)
         
-        # Wait a bit for backend to start
-        time.sleep(2)
-        
-        # Start frontend
-        print("Starting frontend server on http://localhost:5173...")
         frontend_process = subprocess.Popen(
             ["npm", "run", "dev"],
             cwd=FRONTEND_DIR,
@@ -110,6 +116,14 @@ def start_servers():
             text=True
         )
         processes.append(frontend_process)
+        
+        # Wait for backend to be ready (check health endpoint)
+        print("Waiting for servers to start...", end="", flush=True)
+        backend_ready = wait_for_server("http://localhost:8000/", timeout=5)
+        if backend_ready:
+            print(" ✓")
+        else:
+            print(" (backend may still be starting)")
         
         print("\n" + "="*60)
         print("✓ Both servers are running!")

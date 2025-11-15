@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 
 const API_BASE = 'http://localhost:8000'
-const POLL_INTERVAL = 250 // ms
+const POLL_INTERVAL = 50 // ms (20 updates per second for smooth UI)
 
 function App() {
   const [drones, setDrones] = useState([])
@@ -10,6 +10,9 @@ function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState(null)
   const [dragEnd, setDragEnd] = useState(null)
+  const dragShiftKey = useRef(false)
+  const dragStartSelection = useRef(new Set())
+  const justFinishedDrag = useRef(false)
   const svgRef = useRef(null)
   const worldWidth = 1000
   const worldHeight = 1000
@@ -31,21 +34,28 @@ function App() {
     return () => clearInterval(interval)
   }, [])
 
-  // Convert screen coordinates to world coordinates
+  // Convert screen coordinates to world coordinates using SVG's native transformation
   const screenToWorld = useCallback((screenX, screenY) => {
     if (!svgRef.current) return { x: 0, y: 0 }
     const svg = svgRef.current
-    const rect = svg.getBoundingClientRect()
-    const scaleX = worldWidth / rect.width
-    const scaleY = worldHeight / rect.height
+    const pt = svg.createSVGPoint()
+    pt.x = screenX
+    pt.y = screenY
+    const svgPoint = pt.matrixTransform(svg.getScreenCTM().inverse())
     return {
-      x: (screenX - rect.left) * scaleX,
-      y: (screenY - rect.top) * scaleY
+      x: svgPoint.x,
+      y: svgPoint.y
     }
-  }, [worldWidth, worldHeight])
+  }, [])
 
   // Handle click on map (move selected drones)
   const handleMapClick = useCallback(async (e) => {
+    // Don't move drones if we just finished a drag operation
+    if (justFinishedDrag.current) {
+      justFinishedDrag.current = false
+      return
+    }
+    
     if (selectedDrones.size === 0) return
 
     const worldPos = screenToWorld(e.clientX, e.clientY)
@@ -71,58 +81,116 @@ function App() {
     }
   }, [selectedDrones, screenToWorld])
 
-  // Handle click on drone (toggle selection)
+  // Handle click on drone (select, or add to selection with shift)
   const handleDroneClick = useCallback((e, droneId) => {
     e.stopPropagation()
     setSelectedDrones(prev => {
-      const next = new Set(prev)
-      if (next.has(droneId)) {
-        next.delete(droneId)
+      if (e.shiftKey) {
+        // Shift+click: toggle this drone in selection
+        const next = new Set(prev)
+        if (next.has(droneId)) {
+          next.delete(droneId)
+        } else {
+          next.add(droneId)
+        }
+        return next
       } else {
-        next.add(droneId)
+        // Regular click: select only this drone
+        return new Set([droneId])
       }
-      return next
     })
   }, [])
 
   // Selection box drag handlers
   const handleMouseDown = useCallback((e) => {
-    if (e.target === svgRef.current || e.target.tagName === 'rect') {
-      setIsDragging(true)
+    // Only start dragging if clicking on the map background (not on a drone or selection box)
+    const target = e.target
+    const isBackground = target === svgRef.current || 
+                         target.tagName === 'rect' ||
+                         target.tagName === 'path'
+    const isSelectionBox = target.getAttribute && 
+                          (target.getAttribute('fill') === 'rgba(0, 150, 255, 0.2)' ||
+                           target.getAttribute('stroke') === 'rgba(0, 150, 255, 0.8)')
+    const isDrone = target.tagName === 'circle' || target.tagName === 'g' || target.tagName === 'text'
+    
+    if (isBackground && !isSelectionBox && !isDrone) {
+      // Don't prevent default - let click handler work if it's just a click
+      // Only start tracking for potential drag if mouse moves
+      dragShiftKey.current = e.shiftKey
+      // Preserve the starting selection (we'll clear it only if we actually drag)
+      dragStartSelection.current = new Set(selectedDrones)
       const worldPos = screenToWorld(e.clientX, e.clientY)
       setDragStart(worldPos)
       setDragEnd(worldPos)
-      
-      // Clear selection if not holding shift
-      if (!e.shiftKey) {
-        setSelectedDrones(new Set())
-      }
+      // Don't clear selection yet - wait to see if it's a drag or click
     }
-  }, [screenToWorld])
+  }, [screenToWorld, selectedDrones])
 
   const handleMouseMove = useCallback((e) => {
-    if (isDragging && dragStart) {
+    if (dragStart) {
       const worldPos = screenToWorld(e.clientX, e.clientY)
-      setDragEnd(worldPos)
+      const distance = Math.sqrt(
+        Math.pow(worldPos.x - dragStart.x, 2) + 
+        Math.pow(worldPos.y - dragStart.y, 2)
+      )
+      
+      // Only start showing selection box if mouse moved more than 5 pixels
+      if (distance > 5) {
+        if (!isDragging) {
+          setIsDragging(true)
+          // Now that we're actually dragging, clear selection if shift not held
+          // (Shift+drag will add to existing selection)
+          if (!dragShiftKey.current) {
+            setSelectedDrones(new Set())
+          }
+        }
+        setDragEnd(worldPos)
+      }
     }
   }, [isDragging, dragStart, screenToWorld])
 
   const handleMouseUp = useCallback(() => {
     if (isDragging && dragStart && dragEnd) {
-      // Select drones in selection box
+      // We actually dragged - create selection box
       const minX = Math.min(dragStart.x, dragEnd.x)
       const maxX = Math.max(dragStart.x, dragEnd.x)
       const minY = Math.min(dragStart.y, dragEnd.y)
       const maxY = Math.max(dragStart.y, dragEnd.y)
 
-      const newSelection = new Set(selectedDrones)
+      // Add drones in box to selection (or replace if shift not held)
+      // Use the preserved starting selection if shift was held
+      const newSelection = dragShiftKey.current ? new Set(dragStartSelection.current) : new Set()
       drones.forEach(drone => {
-        if (drone.x >= minX && drone.x <= maxX && 
+        // Only select friendly drones
+        if (drone.team === "friendly" &&
+            drone.x >= minX && drone.x <= maxX && 
             drone.y >= minY && drone.y <= maxY) {
           newSelection.add(drone.id)
         }
       })
       setSelectedDrones(newSelection)
+      
+      // Mark that we just finished a drag to prevent click handler from firing
+      justFinishedDrag.current = true
+      setTimeout(() => {
+        justFinishedDrag.current = false
+      }, 100)
+    } else if (dragStart && dragEnd) {
+      // Check if it was a small movement (should be treated as click)
+      const dragDistance = Math.sqrt(
+        Math.pow(dragEnd.x - dragStart.x, 2) + 
+        Math.pow(dragEnd.y - dragStart.y, 2)
+      )
+      if (dragDistance < 5) {
+        // Very small movement, treat as click - allow click handler to fire
+        justFinishedDrag.current = false
+      } else {
+        // Some movement but not enough to trigger drag - still prevent click
+        justFinishedDrag.current = true
+        setTimeout(() => {
+          justFinishedDrag.current = false
+        }, 100)
+      }
     }
     setIsDragging(false)
     setDragStart(null)
@@ -130,7 +198,9 @@ function App() {
   }, [isDragging, dragStart, dragEnd, drones, selectedDrones])
 
   useEffect(() => {
-    if (isDragging) {
+    // Always listen for mouse move and up when we have a drag start
+    // This allows us to detect if it's a click vs drag
+    if (dragStart !== null) {
       window.addEventListener('mousemove', handleMouseMove)
       window.addEventListener('mouseup', handleMouseUp)
       return () => {
@@ -138,7 +208,20 @@ function App() {
         window.removeEventListener('mouseup', handleMouseUp)
       }
     }
-  }, [isDragging, handleMouseMove, handleMouseUp])
+  }, [dragStart, handleMouseMove, handleMouseUp])
+
+  // Handle ESC key to deselect all drones
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setSelectedDrones(new Set())
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [])
 
   // Calculate selection box coordinates
   const selectionBox = isDragging && dragStart && dragEnd ? {
@@ -153,7 +236,8 @@ function App() {
       <div className="header">
         <h1>Drone Swarm Control</h1>
         <div className="info">
-          <span>Drones: {drones.length}</span>
+          <span>Friendly: {drones.filter(d => d.team === 'friendly').length}</span>
+          <span>Enemy: {drones.filter(d => d.team === 'enemy').length}</span>
           <span>Selected: {selectedDrones.size}</span>
         </div>
       </div>
@@ -185,42 +269,56 @@ function App() {
               stroke="rgba(0, 150, 255, 0.8)"
               strokeWidth="2"
               strokeDasharray="5,5"
+              pointerEvents="none"
             />
           )}
 
           {/* Drones */}
           {drones.map(drone => {
-            const isSelected = selectedDrones.has(drone.id)
+            const isFriendly = drone.team === "friendly"
+            const isSelected = isFriendly && selectedDrones.has(drone.id)
+            
+            // Color scheme: friendly = blue, enemy = red
+            const colors = isFriendly ? {
+              fill: isSelected ? "#00aaff" : "#0088ff",
+              stroke: isSelected ? "#ffffff" : "#0066cc",
+            } : {
+              fill: "#ff4444",
+              stroke: "#cc0000",
+            }
+            
             return (
               <g
                 key={drone.id}
-                onClick={(e) => handleDroneClick(e, drone.id)}
-                style={{ cursor: 'pointer' }}
+                onClick={isFriendly ? (e) => handleDroneClick(e, drone.id) : undefined}
+                style={{ cursor: isFriendly ? 'pointer' : 'default' }}
               >
                 {/* Drone circle */}
                 <circle
                   cx={drone.x}
                   cy={drone.y}
                   r={isSelected ? 12 : 10}
-                  fill={isSelected ? "#00aaff" : "#00ff88"}
-                  stroke={isSelected ? "#ffffff" : "#00cc66"}
+                  fill={colors.fill}
+                  stroke={colors.stroke}
                   strokeWidth={isSelected ? 3 : 2}
                   className="drone"
                 />
-                {/* Drone ID label */}
-                <text
-                  x={drone.x}
-                  y={drone.y - 18}
-                  textAnchor="middle"
-                  fill="#ffffff"
-                  fontSize="10"
-                  fontWeight="bold"
-                  pointerEvents="none"
-                >
-                  {drone.id.replace('drone_', '')}
-                </text>
-                {/* Target indicator */}
-                {drone.mode === "moving" && drone.target_x !== null && drone.target_y !== null && (
+                {/* Drone ID label (only for friendly drones) */}
+                {isFriendly && (
+                  <text
+                    x={drone.x}
+                    y={drone.y - 18}
+                    textAnchor="middle"
+                    fill="#ffffff"
+                    fontSize="10"
+                    fontWeight="bold"
+                    pointerEvents="none"
+                  >
+                    {drone.id.replace('drone_', '')}
+                  </text>
+                )}
+                {/* Target indicator (only for friendly drones) */}
+                {isFriendly && drone.mode === "moving" && drone.target_x !== null && drone.target_y !== null && (
                   <g>
                     <circle
                       cx={drone.target_x}
@@ -249,7 +347,7 @@ function App() {
         </svg>
       </div>
       <div className="instructions">
-        <p>Click and drag to select drones • Click on map to move selected drones</p>
+        <p>Click drone to select • Drag box to select multiple • Click map to move • ESC to deselect</p>
       </div>
     </div>
   )
