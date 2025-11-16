@@ -35,12 +35,23 @@ class Drone(BaseModel):
     y: float
     vx: float = 0.0
     vy: float = 0.0
-    mode: str = "idle"  # idle, moving, dispersing, pattern
+    mode: str = "idle"  # idle, moving, dispersing, pattern, patrol, tail
     target_x: Optional[float] = None
     target_y: Optional[float] = None
     team: str = "friendly"  # friendly or enemy
     pattern: Optional[str] = None  # up_down, left_right, circular, None
     pattern_data: Optional[dict] = None  # Pattern-specific state
+    patrol_start_x: Optional[float] = None  # Starting position for patrol
+    patrol_start_y: Optional[float] = None
+    patrol_target_x: Optional[float] = None  # Target position for patrol
+    patrol_target_y: Optional[float] = None
+    patrol_to_target: bool = True  # True = going to target, False = returning to start
+    tail_target_id: Optional[str] = None  # ID of drone being tailed
+    tail_distance: float = 80.0  # Desired distance to maintain from target
+    base_id: str = "base_1"  # Which base this drone belongs to
+    base_x: float = 0.0  # Home base X coordinate
+    base_y: float = 0.0  # Home base Y coordinate
+    base_shape: str = "circle"  # circle, square, triangle - visual shape of base
     last_x: Optional[float] = None  # Previous position for stuck detection
     last_y: Optional[float] = None
     stuck_frames: int = 0  # Number of frames without movement
@@ -69,12 +80,33 @@ class TaskResult(BaseModel):
     task_name: str
     parameters: Dict[str, Any]
 
+class SetBaseRequest(BaseModel):
+    drone_ids: List[str]
+    base_id: str
+
+class PauseCommand(BaseModel):
+    paused: bool
+
+class TimeControlCommand(BaseModel):
+    action: str  # "reverse", "forward", "jump_back"
+
+# Base definitions
+BASES = {
+    "base_1": {"x": 100, "y": 900, "shape": "circle", "name": "Circle Base"},
+    "base_2": {"x": 500, "y": 900, "shape": "square", "name": "Square Base"},
+    "base_3": {"x": 900, "y": 900, "shape": "triangle", "name": "Triangle Base"}
+}
+
 # In-memory world state
 world = {
     "drones": {},
     "last_update": datetime.now().timestamp(),
     "next_command_id": 1,  # Counter for command groups
-    "task_results": []  # Store task execution results for UI display
+    "task_results": [],  # Store task execution results for UI display
+    "paused": False,
+    "time_direction": 1,  # 1 for forward, -1 for reverse
+    "history": [],  # List of world snapshots for time travel
+    "history_index": -1  # Current position in history (-1 = live)
 }
 
 # Available tasks with their function definitions
@@ -90,7 +122,19 @@ AVAILABLE_TASKS = {
     "patrol": {
         "description": "Patrol between two or more locations",
         "parameters": {
-            "locations": "list of dict with x, y coordinates",
+            "locations": "list of dict with x, y coordinates (at least 2 locations)",
+            "friendly_drones": "list of string (friendly drone IDs)"
+        }
+    },
+    "hold": {
+        "description": "Stop selected drones at their current positions",
+        "parameters": {
+            "friendly_drones": "list of string (friendly drone IDs)"
+        }
+    },
+    "return_to_base": {
+        "description": "Send selected drones back to their home bases",
+        "parameters": {
             "friendly_drones": "list of string (friendly drone IDs)"
         }
     }
@@ -105,7 +149,7 @@ ENEMY_SPEED = 40.0  # pixels per second for enemy drones
 WORLD_WIDTH = 1000
 WORLD_HEIGHT = 1000
 SIMULATION_DT = 0.02  # 20ms update interval (50Hz for smooth physics)
-DRONE_VISUAL_RADIUS = 10.0  # Visual radius of drones (matches frontend circle)
+DRONE_VISUAL_RADIUS = 13.0  # Visual radius of drones (increased for better visibility)
 DRONE_STROKE_WIDTH = 3.0  # Maximum stroke width (selected drones have strokeWidth=3, unselected=2)
 # In SVG, stroke is centered on the path, so outer edge is at radius + strokeWidth/2
 # But we'll use radius + strokeWidth to ensure we catch all collisions including the full stroke
@@ -114,28 +158,56 @@ DRONE_RADIUS = DRONE_HITBOX_RADIUS  # Use hitbox radius for collision detection
 GRID_SPACING = DRONE_VISUAL_RADIUS * 2.0  # Spacing between drones in grid (minimal buffer)
 STUCK_THRESHOLD = 0.5  # Movement threshold to consider drone as having moved (pixels)
 STUCK_FRAMES_TO_ARRIVE = 5  # Number of frames without movement to consider "arrived"
+HISTORY_MAX_LENGTH = 500  # Store 500 snapshots (10 seconds at 50Hz)
+HISTORY_SAVE_INTERVAL = 1  # Save every frame
 
 def init_drones():
     """Initialize friendly and enemy drones."""
-    # Initialize friendly drones in a grid pattern
+    # Initialize friendly drones in a square formation at their home bases
     num_friendly = 12
-    cols = 4
-    spacing = 80
-    start_x = 200
-    start_y = 200
+    drones_per_base = 4
+    formation_spacing = 50  # Spacing between drones in square formation
     
     for i in range(num_friendly):
-        row = i // cols
-        col = i % cols
         drone_id = f"drone_{i+1}"
+        
+        # Assign bases: first 4 to base_1, next 4 to base_2, last 4 to base_3
+        if i < 4:
+            base_id = "base_1"
+            formation_index = i
+        elif i < 8:
+            base_id = "base_2"
+            formation_index = i - 4
+        else:
+            base_id = "base_3"
+            formation_index = i - 8
+        
+        base = BASES[base_id]
+        
+        # Calculate position in 2x2 square formation around the base
+        # Formation: 2 columns, 2 rows
+        col = formation_index % 2  # 0 or 1
+        row = formation_index // 2  # 0 or 1
+        
+        # Center the formation on the base
+        offset_x = (col - 0.5) * formation_spacing
+        offset_y = (row - 0.5) * formation_spacing
+        
+        drone_x = base["x"] + offset_x
+        drone_y = base["y"] + offset_y
+        
         world["drones"][drone_id] = Drone(
             id=drone_id,
-            x=start_x + col * spacing,
-            y=start_y + row * spacing,
+            x=drone_x,
+            y=drone_y,
             vx=0.0,
             vy=0.0,
             mode="idle",
-            team="friendly"
+            team="friendly",
+            base_id=base_id,
+            base_x=base["x"],
+            base_y=base["y"],
+            base_shape=base["shape"]
         )
     
     # Initialize enemy drones with different patterns
@@ -322,9 +394,106 @@ def update_drone(drone: Drone, dt: float, all_drones: List[Drone]) -> Drone:
     if drone.team == "enemy" and drone.mode == "pattern":
         return update_enemy_pattern(drone, dt)
     
-    # Handle friendly drone movement (simple, no collision avoidance)
+    # Handle friendly drone movement
     if drone.team == "friendly":
-        if drone.mode == "moving" and drone.target_x is not None and drone.target_y is not None:
+        # Handle tail mode: follow target drone while maintaining distance
+        if drone.mode == "tail" and drone.tail_target_id is not None:
+            # Find the target drone
+            target_drone = None
+            for d in all_drones:
+                if d.id == drone.tail_target_id:
+                    target_drone = d
+                    break
+            
+            if target_drone and target_drone.id != drone.id:
+                # Calculate distance to target
+                dx = target_drone.x - drone.x
+                dy = target_drone.y - drone.y
+                distance = math.sqrt(dx * dx + dy * dy)
+                
+                # Calculate desired position (maintain tail_distance from target)
+                if distance > 0:
+                    direction_x = dx / distance
+                    direction_y = dy / distance
+                else:
+                    direction_x = 0
+                    direction_y = 0
+                
+                # If too far, move closer. If too close, move away
+                distance_error = distance - drone.tail_distance
+                
+                if abs(distance_error) > 2.0:  # Only move if outside acceptable range (reduced for smoother movement)
+                    if distance_error > 0:
+                        # Too far - move towards target
+                        drone.vx = direction_x * DRONE_SPEED
+                        drone.vy = direction_y * DRONE_SPEED
+                    else:
+                        # Too close - move away from target
+                        drone.vx = -direction_x * DRONE_SPEED
+                        drone.vy = -direction_y * DRONE_SPEED
+                    
+                    # Update position
+                    drone.x += drone.vx * dt
+                    drone.y += drone.vy * dt
+                    
+                    # Clamp to world bounds
+                    drone.x = max(0, min(WORLD_WIDTH, drone.x))
+                    drone.y = max(0, min(WORLD_HEIGHT, drone.y))
+                else:
+                    # Within acceptable range - hold position
+                    drone.vx = 0.0
+                    drone.vy = 0.0
+            else:
+                # Target not found or invalid - go idle
+                drone.mode = "idle"
+                drone.tail_target_id = None
+                drone.vx = 0.0
+                drone.vy = 0.0
+        
+        # Handle patrol mode: go back and forth between start and target positions
+        elif drone.mode == "patrol" and drone.patrol_start_x is not None and drone.patrol_target_x is not None:
+            # Determine current target (start or patrol target)
+            if drone.patrol_to_target:
+                target_x = drone.patrol_target_x
+                target_y = drone.patrol_target_y
+            else:
+                target_x = drone.patrol_start_x
+                target_y = drone.patrol_start_y
+            
+            # Calculate distance to current target
+            dx = target_x - drone.x
+            dy = target_y - drone.y
+            distance = math.sqrt(dx * dx + dy * dy)
+            
+            # Check if arrived at current patrol point
+            if distance < 5.0:
+                # Arrived - switch direction
+                drone.patrol_to_target = not drone.patrol_to_target
+                drone.x = target_x
+                drone.y = target_y
+                drone.vx = 0.0
+                drone.vy = 0.0
+            else:
+                # Move towards current patrol point
+                if distance > 0:
+                    direction_x = dx / distance
+                    direction_y = dy / distance
+                else:
+                    direction_x = 0
+                    direction_y = 0
+                
+                drone.vx = direction_x * DRONE_SPEED
+                drone.vy = direction_y * DRONE_SPEED
+                
+                # Update position
+                drone.x += drone.vx * dt
+                drone.y += drone.vy * dt
+                
+                # Clamp to world bounds
+                drone.x = max(0, min(WORLD_WIDTH, drone.x))
+                drone.y = max(0, min(WORLD_HEIGHT, drone.y))
+        
+        elif drone.mode == "moving" and drone.target_x is not None and drone.target_y is not None:
             # Simple movement toward target (can overlap)
             dx = drone.target_x - drone.x
             dy = drone.target_y - drone.y
@@ -450,13 +619,56 @@ def check_collisions():
     
     return len(drones_to_remove) > 0
 
+def save_history_snapshot():
+    """Save current world state to history."""
+    # Create a deep copy of current state
+    snapshot = {
+        "drones": {drone_id: drone.model_copy(deep=True) for drone_id, drone in world["drones"].items()},
+        "timestamp": world["last_update"]
+    }
+    
+    # Add snapshot to history
+    world["history"].append(snapshot)
+    
+    # Limit history size (keep only recent history)
+    if len(world["history"]) > HISTORY_MAX_LENGTH:
+        world["history"].pop(0)
+    
+    # Always point to the end when recording new history
+    world["history_index"] = len(world["history"]) - 1
+
+def restore_from_history(index: int):
+    """Restore world state from history at given index."""
+    if 0 <= index < len(world["history"]):
+        snapshot = world["history"][index]
+        world["drones"] = {drone_id: drone.model_copy(deep=True) for drone_id, drone in snapshot["drones"].items()}
+        world["last_update"] = snapshot["timestamp"]
+        world["history_index"] = index
+        return True
+    return False
+
 async def simulation_loop():
     """Background task that updates drone positions."""
+    frame_count = 0
     while True:
         current_time = datetime.now().timestamp()
         dt = min(SIMULATION_DT, current_time - world["last_update"])
         world["last_update"] = current_time
         
+        # Handle pause
+        if world["paused"]:
+            await asyncio.sleep(SIMULATION_DT)
+            continue
+        
+        # Handle time reversal
+        if world["time_direction"] == -1:
+            # Go backwards in history
+            if world["history_index"] > 0:
+                restore_from_history(world["history_index"] - 1)
+            await asyncio.sleep(SIMULATION_DT)
+            continue
+        
+        # Normal forward simulation
         # Get all drones as a list for collision/separation calculations
         all_drones = list(world["drones"].values())
         
@@ -466,6 +678,11 @@ async def simulation_loop():
         
         # Check for collisions
         check_collisions()
+        
+        # Save history snapshot
+        frame_count += 1
+        if frame_count % HISTORY_SAVE_INTERVAL == 0:
+            save_history_snapshot()
         
         await asyncio.sleep(SIMULATION_DT)
 
@@ -488,34 +705,162 @@ async def get_world():
         timestamp=world["last_update"]
     )
 
-# Dummy task functions (for now just display parameters)
+# Task functions that actually control drones
 def tail_task(enemy_drone: str, friendly_drones: List[str] = None, distance: float = 50.0):
-    """Dummy tail task - just returns display info."""
+    """Tail task - sets drones to follow an enemy drone."""
     if friendly_drones is None:
         friendly_drones = []
+    
+    # Hardcode distance to 50
+    distance = 50.0
+    
+    # Verify enemy drone exists
+    if enemy_drone not in world["drones"]:
+        result = {
+            "task_name": "tail",
+            "parameters": {
+                "enemy_drone": enemy_drone,
+                "friendly_drones": friendly_drones
+            },
+            "success": False,
+            "message": f"Enemy drone {enemy_drone} not found"
+        }
+        world["task_results"].append(result)
+        return result
+    
+    updated_count = 0
+    for drone_id in friendly_drones:
+        if drone_id in world["drones"]:
+            drone = world["drones"][drone_id]
+            if drone.team == "friendly" and drone_id != enemy_drone:
+                drone.mode = "tail"
+                drone.tail_target_id = enemy_drone
+                drone.tail_distance = distance  # Always 50
+                drone.vx = 0.0
+                drone.vy = 0.0
+                drone.command_id = None  # Tail doesn't use command groups
+                world["drones"][drone_id] = drone
+                updated_count += 1
+    
     result = {
         "task_name": "tail",
         "parameters": {
             "enemy_drone": enemy_drone,
-            "friendly_drones": friendly_drones,
-            "distance": distance
-        }
+            "friendly_drones": friendly_drones
+        },
+        "success": True,
+        "updated_drones": updated_count
     }
     world["task_results"].append(result)
     return result
 
 def patrol_task(locations: List[Dict[str, float]] = None, friendly_drones: List[str] = None):
-    """Dummy patrol task - just returns display info."""
-    if locations is None:
-        locations = []
+    """Patrol task - sets drones to patrol between locations."""
+    if locations is None or len(locations) < 2:
+        result = {
+            "task_name": "patrol",
+            "parameters": {
+                "locations": locations or [],
+                "friendly_drones": friendly_drones or []
+            },
+            "success": False,
+            "message": "Patrol requires at least 2 locations"
+        }
+        world["task_results"].append(result)
+        return result
+    
     if friendly_drones is None:
         friendly_drones = []
+    
+    updated_count = 0
+    # For now, patrol between first two locations (can be extended later)
+    start_loc = locations[0]
+    target_loc = locations[1]
+    
+    for drone_id in friendly_drones:
+        if drone_id in world["drones"]:
+            drone = world["drones"][drone_id]
+            if drone.team == "friendly":
+                drone.mode = "patrol"
+                drone.patrol_start_x = start_loc.get("x", drone.x)
+                drone.patrol_start_y = start_loc.get("y", drone.y)
+                drone.patrol_target_x = target_loc.get("x", drone.x)
+                drone.patrol_target_y = target_loc.get("y", drone.y)
+                drone.patrol_to_target = True
+                drone.vx = 0.0
+                drone.vy = 0.0
+                drone.command_id = None  # Patrol doesn't use command groups
+                world["drones"][drone_id] = drone
+                updated_count += 1
+    
     result = {
         "task_name": "patrol",
         "parameters": {
             "locations": locations,
             "friendly_drones": friendly_drones
-        }
+        },
+        "success": True,
+        "updated_drones": updated_count
+    }
+    world["task_results"].append(result)
+    return result
+
+def hold_task(friendly_drones: List[str] = None):
+    """Hold task - stops selected drones."""
+    if friendly_drones is None:
+        friendly_drones = []
+    
+    updated_count = 0
+    for drone_id in friendly_drones:
+        if drone_id in world["drones"]:
+            drone = world["drones"][drone_id]
+            if drone.team == "friendly":
+                drone.mode = "idle"
+                drone.vx = 0.0
+                drone.vy = 0.0
+                drone.target_x = None
+                drone.target_y = None
+                drone.command_id = None
+                world["drones"][drone_id] = drone
+                updated_count += 1
+    
+    result = {
+        "task_name": "hold",
+        "parameters": {
+            "friendly_drones": friendly_drones
+        },
+        "success": True,
+        "updated_drones": updated_count
+    }
+    world["task_results"].append(result)
+    return result
+
+def return_to_base_task(friendly_drones: List[str] = None):
+    """Return to base task - sends drones back to their home bases."""
+    if friendly_drones is None:
+        friendly_drones = []
+    
+    updated_count = 0
+    for drone_id in friendly_drones:
+        if drone_id in world["drones"]:
+            drone = world["drones"][drone_id]
+            if drone.team == "friendly":
+                drone.mode = "moving"
+                drone.target_x = drone.base_x
+                drone.target_y = drone.base_y
+                drone.vx = 0.0
+                drone.vy = 0.0
+                drone.command_id = None  # Return to base doesn't use command groups
+                world["drones"][drone_id] = drone
+                updated_count += 1
+    
+    result = {
+        "task_name": "return_to_base",
+        "parameters": {
+            "friendly_drones": friendly_drones
+        },
+        "success": True,
+        "updated_drones": updated_count
     }
     world["task_results"].append(result)
     return result
@@ -523,13 +868,105 @@ def patrol_task(locations: List[Dict[str, float]] = None, friendly_drones: List[
 # Task function registry
 TASK_FUNCTIONS = {
     "tail": tail_task,
-    "patrol": patrol_task
+    "patrol": patrol_task,
+    "hold": hold_task,
+    "return_to_base": return_to_base_task
 }
 
 @app.get("/tasks")
 async def get_available_tasks():
     """Get list of available tasks."""
     return {"tasks": AVAILABLE_TASKS}
+
+@app.get("/bases")
+async def get_bases():
+    """Get all available bases."""
+    return {"bases": BASES}
+
+@app.post("/set-base")
+async def set_base(request: SetBaseRequest):
+    """Set the home base for selected drones."""
+    if request.base_id not in BASES:
+        return {"success": False, "message": f"Base {request.base_id} not found"}
+    
+    base = BASES[request.base_id]
+    updated_count = 0
+    
+    for drone_id in request.drone_ids:
+        if drone_id in world["drones"]:
+            drone = world["drones"][drone_id]
+            if drone.team == "friendly":
+                drone.base_id = request.base_id
+                drone.base_x = base["x"]
+                drone.base_y = base["y"]
+                drone.base_shape = base["shape"]
+                world["drones"][drone_id] = drone
+                updated_count += 1
+    
+    return {"success": True, "updated_drones": updated_count}
+
+@app.post("/pause")
+async def pause_simulation(command: PauseCommand):
+    """Pause or unpause the simulation."""
+    world["paused"] = command.paused
+    return {"status": "ok", "paused": world["paused"]}
+
+@app.post("/time-control")
+async def time_control(command: TimeControlCommand):
+    """Control time: reverse, forward, or jump back."""
+    if command.action == "reverse":
+        # Toggle reverse mode
+        if world["time_direction"] == 1:
+            world["time_direction"] = -1
+            world["paused"] = False
+        else:
+            world["time_direction"] = 1
+        return {"status": "ok", "time_direction": world["time_direction"]}
+    
+    elif command.action == "forward":
+        # Set to forward mode
+        world["time_direction"] = 1
+        world["paused"] = False
+        return {"status": "ok", "time_direction": world["time_direction"]}
+    
+    elif command.action == "jump_back":
+        # Jump back 5 seconds (250 frames at 50Hz)
+        frames_to_jump = 250
+        
+        # Calculate target index from current position in history
+        if world["history_index"] < 0:
+            # Not in history mode, use the latest
+            target_index = max(0, len(world["history"]) - 1 - frames_to_jump)
+        else:
+            # Already in history, jump back from current position
+            target_index = max(0, world["history_index"] - frames_to_jump)
+        
+        if len(world["history"]) > 0 and restore_from_history(target_index):
+            # Resume normal forward simulation from this point
+            world["time_direction"] = 1
+            world["paused"] = False
+            return {"status": "ok", "jumped_to_index": target_index, "history_length": len(world["history"])}
+        else:
+            return {"status": "error", "message": "Not enough history to jump back 5 seconds"}
+    
+    return {"status": "error", "message": "Invalid action"}
+
+@app.post("/reset")
+async def reset_simulation():
+    """Reset the simulation by reinitializing drones and clearing history."""
+    # Clear current drones and history
+    world["drones"] = {}
+    world["history"] = []
+    world["history_index"] = -1
+    world["next_command_id"] = 1
+    world["paused"] = False
+    world["time_direction"] = 1
+    world["task_results"] = []
+    
+    # Reinitialize drones
+    init_drones()
+    
+    return {"status": "ok", "message": "Simulation reset"}
 
 @app.post("/task/execute")
 async def execute_task(task_execution: TaskExecution):
@@ -660,10 +1097,6 @@ def create_function_definitions() -> List[Dict]:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "List of friendly drone IDs to use for tailing. If the user says 'closest', use the distances_to_enemies data from the world context to find the drone(s) with the smallest distance value for the specified enemy_drone."
-                        },
-                        "distance": {
-                            "type": "number",
-                            "description": "Distance to maintain from the enemy drone (default: 50.0)"
                         }
                     },
                     "required": ["enemy_drone", "friendly_drones"]
@@ -697,6 +1130,42 @@ def create_function_definitions() -> List[Dict]:
                         }
                     },
                     "required": ["locations", "friendly_drones"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "hold",
+                "description": "Stop selected drones at their current positions",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "friendly_drones": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of friendly drone IDs to stop"
+                        }
+                    },
+                    "required": ["friendly_drones"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "return_to_base",
+                "description": "Send selected drones back to their home bases",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "friendly_drones": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of friendly drone IDs to send back to base"
+                        }
+                    },
+                    "required": ["friendly_drones"]
                 }
             }
         }
@@ -745,9 +1214,11 @@ then "drone_12" is closest, "drone_6" is second closest, "drone_9" is third clos
 Available functions:
 - tail(enemy_drone, friendly_drones, distance): Follow an enemy drone with one or more friendly drones
 - patrol(locations, friendly_drones): Patrol between locations with one or more friendly drones
+- hold(friendly_drones): Stop selected drones at their current positions
+- return_to_base(friendly_drones): Send selected drones back to their home bases
 
 CRITICAL RULES:
-1. ONLY call the function that matches what the user requested. If the user says "tail", ONLY call tail(). If the user says "patrol", ONLY call patrol(). Do NOT call multiple different functions.
+1. ONLY call the function that matches what the user requested. If the user says "tail", ONLY call tail(). If the user says "patrol", ONLY call patrol(). If the user says "hold" or "stop", ONLY call hold(). If the user says "return to base" or "go home", ONLY call return_to_base(). Do NOT call multiple different functions.
 2. Call each function exactly ONCE with ALL drones in a single call.
 3. To find the closest drone(s):
    - Use the "closest_drones" object in the world context
@@ -771,6 +1242,16 @@ Example 2: "Tail enemy drone 4 with my 3 closest drones"
 2. Look at closest_drones["enemy_4"]["closest_drones_sorted"][0:3] in the world context
 3. This gives you the 3 closest drone IDs (e.g., ["drone_12", "drone_6", "drone_9"])
 4. Call: tail("enemy_4", ["drone_12", "drone_6", "drone_9"], 50.0)
+
+Example 3: "Stop my closest 3 drones" or "Hold my closest 3 drones"
+1. User wants to stop/hold 3 drones
+2. If no enemy specified, you can use all friendly drones or ask for clarification
+3. Call: hold(["drone_1", "drone_2", "drone_3"])  (ONE call)
+
+Example 4: "Send my drones back to base" or "Return my drones to base"
+1. User wants to return drones to base
+2. Use all friendly drones or the ones mentioned
+3. Call: return_to_base(["drone_1", "drone_2", ...])  (ONE call with all selected drones)
 
 Always use the exact drone IDs from closest_drones_sorted array. The array is pre-sorted - just take the first N elements!
 """
@@ -830,10 +1311,23 @@ Always use the exact drone IDs from closest_drones_sorted array. The array is pr
                         "message": f"Unknown function: {function_name}"
                     })
             
+            # Format tool calls for display
+            tool_calls_display = []
+            for i, tool_call in enumerate(message.tool_calls):
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                    tool_calls_display.append({
+                        "function": tool_call.function.name,
+                        "arguments": function_args
+                    })
+                except:
+                    pass
+            
             return {
                 "success": True,
                 "message": f"Processed command: {command.command}",
                 "results": results,
+                "tool_calls": tool_calls_display,  # Include tool calls for chatbot display
                 "debug": {
                     "world_context": json.loads(world_context)  # Include world context in response for debugging
                 }
