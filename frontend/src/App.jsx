@@ -16,6 +16,16 @@ function App() {
   const svgRef = useRef(null)
   const worldWidth = 1000
   const worldHeight = 1000
+  
+  // Task system state
+  const [showTaskMenu, setShowTaskMenu] = useState(false)
+  const [taskMenuDrone, setTaskMenuDrone] = useState(null)
+  const [taskMenuPosition, setTaskMenuPosition] = useState({ x: 0, y: 0 })
+  const [availableTasks, setAvailableTasks] = useState({})
+  const [selectedTask, setSelectedTask] = useState("")
+  const [taskParams, setTaskParams] = useState({})
+  const [nlCommand, setNlCommand] = useState("")
+  const [taskResults, setTaskResults] = useState([])
 
   // Poll backend for world state
   useEffect(() => {
@@ -31,6 +41,36 @@ function App() {
 
     fetchWorld()
     const interval = setInterval(fetchWorld, POLL_INTERVAL)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Fetch available tasks
+  useEffect(() => {
+    const fetchTasks = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/tasks`)
+        const data = await response.json()
+        setAvailableTasks(data.tasks || {})
+      } catch (error) {
+        console.error('Failed to fetch tasks:', error)
+      }
+    }
+    fetchTasks()
+  }, [])
+
+  // Poll for task results
+  useEffect(() => {
+    const fetchResults = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/task/results`)
+        const data = await response.json()
+        setTaskResults(data.results || [])
+      } catch (error) {
+        console.error('Failed to fetch task results:', error)
+      }
+    }
+    fetchResults()
+    const interval = setInterval(fetchResults, 500) // Poll every 500ms
     return () => clearInterval(interval)
   }, [])
 
@@ -84,6 +124,19 @@ function App() {
   // Handle click on drone (select, or add to selection with shift)
   const handleDroneClick = useCallback((e, droneId) => {
     e.stopPropagation()
+    
+    // Right-click or Ctrl+click to show task menu
+    if (e.button === 2 || e.ctrlKey || e.metaKey) {
+      e.preventDefault()
+      const drone = drones.find(d => d.id === droneId && d.team === "friendly")
+      if (drone) {
+        setTaskMenuDrone(drone)
+        setTaskMenuPosition({ x: e.clientX, y: e.clientY })
+        setShowTaskMenu(true)
+      }
+      return
+    }
+    
     setSelectedDrones(prev => {
       if (e.shiftKey) {
         // Shift+click: toggle this drone in selection
@@ -99,7 +152,65 @@ function App() {
         return new Set([droneId])
       }
     })
-  }, [])
+  }, [drones])
+
+  // Handle task execution via UI
+  const handleExecuteTask = useCallback(async () => {
+    if (!selectedTask || !taskMenuDrone) return
+    
+    const params = {
+      friendly_drones: Array.from(selectedDrones.size > 0 ? selectedDrones : new Set([taskMenuDrone.id])),
+      ...taskParams
+    }
+    
+    try {
+      const response = await fetch(`${API_BASE}/task/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_name: selectedTask,
+          drone_ids: params.friendly_drones,
+          parameters: params
+        })
+      })
+      const data = await response.json()
+      if (data.success) {
+        setShowTaskMenu(false)
+        setSelectedTask("")
+        setTaskParams({})
+      }
+    } catch (error) {
+      console.error('Failed to execute task:', error)
+    }
+  }, [selectedTask, taskMenuDrone, selectedDrones, taskParams])
+
+  // Handle natural language command
+  const handleNlCommand = useCallback(async () => {
+    if (!nlCommand.trim()) return
+    
+    try {
+      const response = await fetch(`${API_BASE}/nl/command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: nlCommand })
+      })
+      const data = await response.json()
+      if (data.success) {
+        setNlCommand("")
+        // Results will appear in task results panel automatically
+        // Debug: Log world context to browser console
+        if (data.debug && data.debug.world_context) {
+          console.log('World Context (for debugging):', JSON.stringify(data.debug.world_context, null, 2))
+        }
+      } else {
+        console.error('NL command error:', data)
+        alert(`Error: ${data.message}`)
+      }
+    } catch (error) {
+      console.error('Failed to process natural language command:', error)
+      alert(`Failed to process command: ${error.message}`)
+    }
+  }, [nlCommand])
 
   // Selection box drag handlers
   const handleMouseDown = useCallback((e) => {
@@ -210,11 +321,12 @@ function App() {
     }
   }, [dragStart, handleMouseMove, handleMouseUp])
 
-  // Handle ESC key to deselect all drones
+  // Handle ESC key to deselect all drones and close task menu
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
         setSelectedDrones(new Set())
+        setShowTaskMenu(false)
       }
     }
     window.addEventListener('keydown', handleKeyDown)
@@ -222,6 +334,21 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown)
     }
   }, [])
+
+  // Close task menu when clicking outside
+  useEffect(() => {
+    if (showTaskMenu) {
+      const handleClickOutside = (e) => {
+        if (!e.target.closest('.task-menu')) {
+          setShowTaskMenu(false)
+        }
+      }
+      window.addEventListener('click', handleClickOutside)
+      return () => {
+        window.removeEventListener('click', handleClickOutside)
+      }
+    }
+  }, [showTaskMenu])
 
   // Calculate selection box coordinates
   const selectionBox = isDragging && dragStart && dragEnd ? {
@@ -291,6 +418,7 @@ function App() {
               <g
                 key={drone.id}
                 onClick={isFriendly ? (e) => handleDroneClick(e, drone.id) : undefined}
+                onContextMenu={isFriendly ? (e) => handleDroneClick(e, drone.id) : undefined}
                 style={{ cursor: isFriendly ? 'pointer' : 'default' }}
               >
                 {/* Drone circle */}
@@ -303,21 +431,19 @@ function App() {
                   strokeWidth={isSelected ? 3 : 2}
                   className="drone"
                 />
-                {/* Drone ID label (only for friendly drones) - centered on circle */}
-                {isFriendly && (
-                  <text
-                    x={drone.x}
-                    y={drone.y}
-                    textAnchor="middle"
-                    dominantBaseline="central"
-                    fill="#ffffff"
-                    fontSize="10"
-                    fontWeight="bold"
-                    pointerEvents="none"
-                  >
-                    {drone.id.replace('drone_', '')}
-                  </text>
-                )}
+                {/* Drone ID label - centered on circle */}
+                <text
+                  x={drone.x}
+                  y={drone.y}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  fill="#ffffff"
+                  fontSize="10"
+                  fontWeight="bold"
+                  pointerEvents="none"
+                >
+                  {isFriendly ? drone.id.replace('drone_', '') : drone.id.replace('enemy_', '')}
+                </text>
                 {/* Target indicator (only for friendly drones) */}
                 {isFriendly && drone.mode === "moving" && drone.target_x !== null && drone.target_y !== null && (
                   <g>
@@ -348,8 +474,116 @@ function App() {
         </svg>
       </div>
       <div className="instructions">
-        <p>Click drone to select • Drag box to select multiple • Click map to move • ESC to deselect</p>
+        <p>Click drone to select • Drag box to select multiple • Click map to move • ESC to deselect • Ctrl+Click drone for task menu</p>
       </div>
+      
+      {/* Task Menu Dropdown */}
+      {showTaskMenu && taskMenuDrone && (
+        <div 
+          className="task-menu"
+          style={{
+            position: 'fixed',
+            left: taskMenuPosition.x,
+            top: taskMenuPosition.y,
+            zIndex: 1000
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="task-menu-header">
+            <h3>Task Menu - {taskMenuDrone.id}</h3>
+            <button onClick={() => setShowTaskMenu(false)}>×</button>
+          </div>
+          <div className="task-menu-content">
+            <label>
+              Select Task:
+              <select 
+                value={selectedTask} 
+                onChange={(e) => {
+                  setSelectedTask(e.target.value)
+                  setTaskParams({})
+                }}
+              >
+                <option value="">-- Select Task --</option>
+                {Object.entries(availableTasks).map(([name, task]) => (
+                  <option key={name} value={name}>{name}</option>
+                ))}
+              </select>
+            </label>
+            
+            {selectedTask === "tail" && (
+              <div className="task-params">
+                <label>
+                  Enemy Drone:
+                  <select 
+                    value={taskParams.enemy_drone || ""}
+                    onChange={(e) => setTaskParams({...taskParams, enemy_drone: e.target.value})}
+                  >
+                    <option value="">-- Select Enemy --</option>
+                    {drones.filter(d => d.team === "enemy").map(d => (
+                      <option key={d.id} value={d.id}>{d.id}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Distance:
+                  <input 
+                    type="number" 
+                    value={taskParams.distance || 50}
+                    onChange={(e) => setTaskParams({...taskParams, distance: parseFloat(e.target.value)})}
+                    min="10"
+                    max="200"
+                  />
+                </label>
+              </div>
+            )}
+            
+            {selectedTask === "patrol" && (
+              <div className="task-params">
+                <p>Click on map to set patrol points (coming soon)</p>
+              </div>
+            )}
+            
+            <button 
+              onClick={handleExecuteTask}
+              disabled={!selectedTask}
+              className="execute-button"
+            >
+              Execute
+            </button>
+          </div>
+        </div>
+      )}
+      
+      {/* Natural Language Command Panel */}
+      <div className="nl-panel">
+        <h3>Natural Language Commands</h3>
+        <div className="nl-input-group">
+          <input
+            type="text"
+            value={nlCommand}
+            onChange={(e) => setNlCommand(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleNlCommand()}
+            placeholder="e.g., 'Tail enemy drone 1 with my three closest drones'"
+            className="nl-input"
+          />
+          <button onClick={handleNlCommand} className="nl-button">
+            Execute
+          </button>
+        </div>
+      </div>
+      
+      {/* Task Results Display */}
+      {taskResults.length > 0 && (
+        <div className="task-results">
+          <h3>Recent Task Executions</h3>
+          {taskResults.slice().reverse().map((result, idx) => (
+            <div key={idx} className="task-result-item">
+              <strong>{result.task_name}</strong>
+              <pre>{JSON.stringify(result.parameters, null, 2)}</pre>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

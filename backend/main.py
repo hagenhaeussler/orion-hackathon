@@ -4,10 +4,18 @@ FastAPI backend for drone swarm simulation.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import asyncio
 from datetime import datetime
 import math
+import json
+import os
+from pathlib import Path
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = FastAPI(title="Drone Swarm API")
 
@@ -47,15 +55,52 @@ class Command(BaseModel):
     target_x: float
     target_y: float
 
+class TaskExecution(BaseModel):
+    task_name: str
+    drone_ids: List[str]
+    parameters: Dict[str, Any]
+
+class NaturalLanguageCommand(BaseModel):
+    command: str
+
+class TaskResult(BaseModel):
+    success: bool
+    message: str
+    task_name: str
+    parameters: Dict[str, Any]
+
 # In-memory world state
 world = {
     "drones": {},
     "last_update": datetime.now().timestamp(),
-    "next_command_id": 1  # Counter for command groups
+    "next_command_id": 1,  # Counter for command groups
+    "task_results": []  # Store task execution results for UI display
 }
 
+# Available tasks with their function definitions
+AVAILABLE_TASKS = {
+    "tail": {
+        "description": "Follow an enemy drone while maintaining a certain distance",
+        "parameters": {
+            "enemy_drone": "string (enemy drone ID)",
+            "friendly_drones": "list of string (friendly drone IDs)",
+            "distance": "float (distance to maintain)"
+        }
+    },
+    "patrol": {
+        "description": "Patrol between two or more locations",
+        "parameters": {
+            "locations": "list of dict with x, y coordinates",
+            "friendly_drones": "list of string (friendly drone IDs)"
+        }
+    }
+}
+
+# OpenAI client (will be initialized with API key)
+openai_client = None
+
 # Simulation parameters
-DRONE_SPEED = 100.0  # pixels per second (increased for faster movement)
+DRONE_SPEED = 200.0  # pixels per second (increased for faster movement)
 ENEMY_SPEED = 40.0  # pixels per second for enemy drones
 WORLD_WIDTH = 1000
 WORLD_HEIGHT = 1000
@@ -337,7 +382,7 @@ def update_drone(drone: Drone, dt: float, all_drones: List[Drone]) -> Drone:
                 drone.target_y = None
                 drone.command_id = None
             else:
-                # Move toward grid position
+                # Move toward grid position with deceleration to prevent overshooting
                 if distance > 0:
                     direction_x = dx / distance
                     direction_y = dy / distance
@@ -345,8 +390,18 @@ def update_drone(drone: Drone, dt: float, all_drones: List[Drone]) -> Drone:
                     direction_x = 0
                     direction_y = 0
                 
-                drone.vx = direction_x * DRONE_SPEED
-                drone.vy = direction_y * DRONE_SPEED
+                # Decelerate as we approach target to prevent overshooting
+                # At high speeds, we need to slow down when close to target
+                deceleration_distance = max(10.0, DRONE_SPEED * dt * 2)  # Slow down when within 2 frames of travel
+                if distance < deceleration_distance:
+                    # Scale speed based on distance (smooth deceleration)
+                    speed_factor = distance / deceleration_distance
+                    current_speed = DRONE_SPEED * speed_factor
+                else:
+                    current_speed = DRONE_SPEED
+                
+                drone.vx = direction_x * current_speed
+                drone.vy = direction_y * current_speed
                 
                 # Update position
                 drone.x += drone.vx * dt
@@ -433,6 +488,75 @@ async def get_world():
         timestamp=world["last_update"]
     )
 
+# Dummy task functions (for now just display parameters)
+def tail_task(enemy_drone: str, friendly_drones: List[str] = None, distance: float = 50.0):
+    """Dummy tail task - just returns display info."""
+    if friendly_drones is None:
+        friendly_drones = []
+    result = {
+        "task_name": "tail",
+        "parameters": {
+            "enemy_drone": enemy_drone,
+            "friendly_drones": friendly_drones,
+            "distance": distance
+        }
+    }
+    world["task_results"].append(result)
+    return result
+
+def patrol_task(locations: List[Dict[str, float]] = None, friendly_drones: List[str] = None):
+    """Dummy patrol task - just returns display info."""
+    if locations is None:
+        locations = []
+    if friendly_drones is None:
+        friendly_drones = []
+    result = {
+        "task_name": "patrol",
+        "parameters": {
+            "locations": locations,
+            "friendly_drones": friendly_drones
+        }
+    }
+    world["task_results"].append(result)
+    return result
+
+# Task function registry
+TASK_FUNCTIONS = {
+    "tail": tail_task,
+    "patrol": patrol_task
+}
+
+@app.get("/tasks")
+async def get_available_tasks():
+    """Get list of available tasks."""
+    return {"tasks": AVAILABLE_TASKS}
+
+@app.post("/task/execute")
+async def execute_task(task_execution: TaskExecution):
+    """Execute a task via UI."""
+    if task_execution.task_name not in TASK_FUNCTIONS:
+        return {"success": False, "message": f"Unknown task: {task_execution.task_name}"}
+    
+    task_func = TASK_FUNCTIONS[task_execution.task_name]
+    
+    # Call the task function with parameters
+    try:
+        result = task_func(**task_execution.parameters)
+        return {
+            "success": True,
+            "message": f"Task {task_execution.task_name} executed",
+            "task_name": result["task_name"],
+            "parameters": result["parameters"]
+        }
+    except Exception as e:
+        return {"success": False, "message": f"Error executing task: {str(e)}"}
+
+@app.get("/task/results")
+async def get_task_results():
+    """Get recent task execution results."""
+    results = world["task_results"][-10:]  # Last 10 results
+    return {"results": results}
+
 @app.post("/command")
 async def send_command(command: Command):
     """Send a command to move selected drones to a target location."""
@@ -459,6 +583,281 @@ async def send_command(command: Command):
         "updated_drones": updated_count,
         "target": {"x": command.target_x, "y": command.target_y}
     }
+
+def get_world_context() -> str:
+    """Get current world state as context for LLM, including distance calculations."""
+    friendly_drones = [d for d in world["drones"].values() if d.team == "friendly"]
+    enemy_drones = [d for d in world["drones"].values() if d.team == "enemy"]
+    
+    # Calculate distances from each friendly drone to each enemy drone
+    # This helps the LLM identify "closest" drones accurately
+    friendly_with_distances = []
+    for friendly in friendly_drones:
+        distances_to_enemies = {}
+        for enemy in enemy_drones:
+            dx = enemy.x - friendly.x
+            dy = enemy.y - friendly.y
+            distance = math.sqrt(dx * dx + dy * dy)
+            distances_to_enemies[enemy.id] = round(distance, 1)
+        friendly_with_distances.append({
+            "id": friendly.id,
+            "x": round(friendly.x, 1),
+            "y": round(friendly.y, 1),
+            "distances_to_enemies": distances_to_enemies
+        })
+    
+    # Pre-calculate closest drones for each enemy in sorted order (closest first)
+    closest_drones_by_enemy = {}
+    for enemy in enemy_drones:
+        # Find distances from all friendly drones to this enemy
+        distances = []
+        for friendly in friendly_drones:
+            dx = enemy.x - friendly.x
+            dy = enemy.y - friendly.y
+            distance = math.sqrt(dx * dx + dy * dy)
+            distances.append((friendly.id, round(distance, 1)))
+        
+        # Sort by distance (closest first)
+        distances.sort(key=lambda x: x[1])
+        
+        # Extract just the drone IDs in sorted order (closest first)
+        sorted_drone_ids = [drone_id for drone_id, _ in distances]
+        
+        # Store both the single closest and the full sorted list
+        if distances:
+            closest_drones_by_enemy[enemy.id] = {
+                "closest_drone": distances[0][0],  # Single closest (for backward compatibility)
+                "distance": distances[0][1],
+                "closest_drones_sorted": sorted_drone_ids,  # All drones sorted by distance (closest first)
+                "distances_sorted": distances  # Full list with distances for reference
+            }
+    
+    context = {
+        "friendly_drones": friendly_with_distances,
+        "enemy_drones": [
+            {"id": d.id, "x": round(d.x, 1), "y": round(d.y, 1)} for d in enemy_drones
+        ],
+        "closest_drones": closest_drones_by_enemy  # Pre-calculated: enemy_id -> closest friendly drone
+    }
+    return json.dumps(context, indent=2)
+
+def create_function_definitions() -> List[Dict]:
+    """Create OpenAI function definitions for available tasks."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "tail",
+                "description": "Follow an enemy drone while maintaining a certain distance",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "enemy_drone": {
+                            "type": "string",
+                            "description": "The ID of the enemy drone to tail (e.g., 'enemy_1')"
+                        },
+                        "friendly_drones": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of friendly drone IDs to use for tailing. If the user says 'closest', use the distances_to_enemies data from the world context to find the drone(s) with the smallest distance value for the specified enemy_drone."
+                        },
+                        "distance": {
+                            "type": "number",
+                            "description": "Distance to maintain from the enemy drone (default: 50.0)"
+                        }
+                    },
+                    "required": ["enemy_drone", "friendly_drones"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "patrol",
+                "description": "Patrol between two or more locations in a loop",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "locations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"}
+                                },
+                                "required": ["x", "y"]
+                            },
+                            "description": "List of locations to patrol between (at least 2 points)"
+                        },
+                        "friendly_drones": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of friendly drone IDs to use for patrolling"
+                        }
+                    },
+                    "required": ["locations", "friendly_drones"]
+                }
+            }
+        }
+    ]
+
+@app.post("/nl/command")
+async def process_natural_language(command: NaturalLanguageCommand):
+    """Process natural language command using OpenAI."""
+    global openai_client
+    
+    # Initialize OpenAI client if not already done
+    if openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return {
+                "success": False,
+                "message": "OpenAI API key not set. Please create a .env file with OPENAI_API_KEY=your_key"
+            }
+        try:
+            openai_client = OpenAI(api_key=api_key)
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Failed to initialize OpenAI client: {str(e)}"
+            }
+    
+    # Get current world context
+    world_context = get_world_context()
+    
+    # Create system prompt
+    system_prompt = f"""You are a drone command assistant. You help users control drones using natural language.
+
+Current world state:
+{world_context}
+
+IMPORTANT: The world context includes a "closest_drones" object that PRE-CALCULATES all friendly drones sorted by distance for each enemy.
+To find the closest drone(s) to a specific enemy (e.g., "enemy_4"):
+- Look at closest_drones["enemy_4"]["closest_drones_sorted"] - this is an array of all friendly drone IDs sorted by distance (closest first)
+- For "closest drone" (singular): use the FIRST element: closest_drones["enemy_4"]["closest_drones_sorted"][0]
+- For "closest 3 drones" (plural): use the FIRST 3 elements: closest_drones["enemy_4"]["closest_drones_sorted"][0:3]
+- You do NOT need to calculate anything - it's already sorted for you!
+
+Example: If closest_drones["enemy_4"]["closest_drones_sorted"] = ["drone_12", "drone_6", "drone_9", ...], 
+then "drone_12" is closest, "drone_6" is second closest, "drone_9" is third closest, etc.
+
+Available functions:
+- tail(enemy_drone, friendly_drones, distance): Follow an enemy drone with one or more friendly drones
+- patrol(locations, friendly_drones): Patrol between locations with one or more friendly drones
+
+CRITICAL RULES:
+1. ONLY call the function that matches what the user requested. If the user says "tail", ONLY call tail(). If the user says "patrol", ONLY call patrol(). Do NOT call multiple different functions.
+2. Call each function exactly ONCE with ALL drones in a single call.
+3. To find the closest drone(s):
+   - Use the "closest_drones" object in the world context
+   - For enemy "enemy_X", look at closest_drones["enemy_X"]["closest_drones_sorted"]
+   - This is an array of drone IDs sorted by distance (closest first)
+   - For 1 drone: use [0] (first element)
+   - For 3 drones: use [0:3] (first 3 elements)
+   - For N drones: use [0:N] (first N elements)
+4. DO NOT make multiple separate function calls. DO NOT call the function once per drone.
+
+Step-by-step examples:
+
+Example 1: "Tail enemy drone 4 with my closest drone"
+1. User wants to tail "enemy_4" with 1 closest drone
+2. Look at closest_drones["enemy_4"]["closest_drones_sorted"][0] in the world context
+3. This gives you the closest drone ID (e.g., "drone_12")
+4. Call: tail("enemy_4", ["drone_12"], 50.0)
+
+Example 2: "Tail enemy drone 4 with my 3 closest drones"
+1. User wants to tail "enemy_4" with 3 closest drones
+2. Look at closest_drones["enemy_4"]["closest_drones_sorted"][0:3] in the world context
+3. This gives you the 3 closest drone IDs (e.g., ["drone_12", "drone_6", "drone_9"])
+4. Call: tail("enemy_4", ["drone_12", "drone_6", "drone_9"], 50.0)
+
+Always use the exact drone IDs from closest_drones_sorted array. The array is pre-sorted - just take the first N elements!
+"""
+    
+    try:
+        # Call OpenAI API in a thread pool to avoid blocking the event loop
+        # This prevents the simulation from freezing during the API call
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": command.command}
+                ],
+                tools=create_function_definitions(),
+                tool_choice="auto",
+                temperature=0.1  # Lower temperature for more deterministic, accurate responses
+            )
+        )
+        
+        message = response.choices[0].message
+        
+        # Check if function was called
+        if message.tool_calls:
+            results = []
+            for tool_call in message.tool_calls:
+                function_name = tool_call.function.name
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    results.append({
+                        "success": False,
+                        "message": f"Failed to parse function arguments: {str(e)}"
+                    })
+                    continue
+                
+                # Execute the function
+                if function_name in TASK_FUNCTIONS:
+                    try:
+                        task_func = TASK_FUNCTIONS[function_name]
+                        result = task_func(**function_args)
+                        results.append({
+                            "success": True,
+                            "task_name": result["task_name"],
+                            "parameters": result["parameters"]
+                        })
+                    except Exception as e:
+                        results.append({
+                            "success": False,
+                            "message": f"Error executing {function_name}: {str(e)}"
+                        })
+                else:
+                    results.append({
+                        "success": False,
+                        "message": f"Unknown function: {function_name}"
+                    })
+            
+            return {
+                "success": True,
+                "message": f"Processed command: {command.command}",
+                "results": results,
+                "debug": {
+                    "world_context": json.loads(world_context)  # Include world context in response for debugging
+                }
+            }
+        else:
+            # No function was called - LLM might have responded with text
+            if message.content:
+                return {
+                    "success": False,
+                    "message": f"LLM response: {message.content}. Could not parse as command. Please try rephrasing."
+                }
+            return {
+                "success": False,
+                "message": "Could not parse command. Please try rephrasing."
+            }
+    
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error processing NL command: {error_details}")  # Log to console for debugging
+        return {
+            "success": False,
+            "message": f"Error processing command: {str(e)}"
+        }
 
 if __name__ == "__main__":
     import uvicorn

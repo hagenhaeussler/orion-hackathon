@@ -8,6 +8,11 @@ A real-time strategy (RTS) style web interface for controlling a swarm of simula
 - **Intuitive selection**: Click individual drones or drag to select multiple
 - **Command interface**: Click anywhere on the map to move selected drones
 - **Smooth simulation**: Backend continuously updates drone positions with physics-based movement
+- **Task system**: Execute predefined tasks via UI dropdown menu (Ctrl+Click on drone)
+- **Natural language commands**: Control drones using natural language with OpenAI integration
+- **Enemy drones**: Red enemy drones move in patterns (up-down, left-right, circular)
+- **Combat system**: Collide friendly drones with enemies to destroy both
+- **Grid formation**: Drones automatically form square grids when arriving at destinations
 
 ## Tech Stack
 
@@ -22,6 +27,7 @@ A real-time strategy (RTS) style web interface for controlling a swarm of simula
 - Python 3.8 or higher
 - Node.js 16 or higher
 - npm (comes with Node.js)
+- OpenAI API key (for natural language commands)
 
 ### Running the Application
 
@@ -39,6 +45,11 @@ This will:
 5. Start the frontend server on `http://localhost:5173`
 
 **Note:** Dependencies are installed in a project-local virtual environment (`venv/`) and won't affect your system Python or conda environment.
+
+**OpenAI API Key Setup:**
+1. Create a `.env` file in the project root (copy from `.env.example`)
+2. Add your OpenAI API key: `OPENAI_API_KEY=your_key_here`
+3. The backend will automatically load it when processing natural language commands
 
 The script works on both **Mac** and **Windows**.
 
@@ -65,16 +76,28 @@ npm run dev
 1. **Select drones**: 
    - Click on individual drones to select/deselect
    - Click and drag to create a selection box (selects all drones in the box)
+   - Press ESC to deselect all
 
 2. **Move drones**:
    - Select one or more drones
    - Click anywhere on the map to set their destination
-   - Drones will smoothly move to the target location
+   - Drones will move to the target and form a grid formation
 
-3. **Visual indicators**:
-   - Green circles = unselected drones
-   - Blue circles = selected drones
+3. **Task menu** (Ctrl+Click or Right-click on friendly drone):
+   - Select a task from the dropdown
+   - Configure parameters (e.g., enemy drone, distance)
+   - Click Execute to run the task
+
+4. **Natural language commands**:
+   - Type commands in the bottom-right panel
+   - Examples: "Tail enemy drone 1 with my three closest drones"
+   - The LLM will parse and execute the command
+
+5. **Visual indicators**:
+   - Blue circles = friendly drones
+   - Red circles = enemy drones
    - Orange dashed lines = movement targets and paths
+   - Task results displayed in top-right panel
 
 ## Project Structure
 
@@ -101,13 +124,10 @@ orion-hackathon/
 
 - `GET /world` - Returns current state of all drones
 - `POST /command` - Sends movement command to selected drones
-  ```json
-  {
-    "drone_ids": ["drone_1", "drone_2"],
-    "target_x": 500,
-    "target_y": 300
-  }
-  ```
+- `GET /tasks` - Returns available tasks
+- `POST /task/execute` - Execute a task via UI
+- `POST /nl/command` - Process natural language command
+- `GET /task/results` - Get recent task execution results
 
 ## Development Notes
 

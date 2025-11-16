@@ -50,7 +50,7 @@ def check_dependencies():
     # Check if backend dependencies are installed in venv
     try:
         result = subprocess.run(
-            [str(venv_python), "-c", "import fastapi; import uvicorn"],
+            [str(venv_python), "-c", "import fastapi; import uvicorn; import openai; import dotenv"],
             capture_output=True,
             check=True
         )
