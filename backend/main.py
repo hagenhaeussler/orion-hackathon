@@ -35,7 +35,7 @@ class Drone(BaseModel):
     y: float
     vx: float = 0.0
     vy: float = 0.0
-    mode: str = "idle"  # idle, moving, dispersing, pattern, patrol, tail
+    mode: str = "idle"  # idle, moving, dispersing, pattern, patrol, tail, intercept
     target_x: Optional[float] = None
     target_y: Optional[float] = None
     team: str = "friendly"  # friendly or enemy
@@ -48,6 +48,9 @@ class Drone(BaseModel):
     patrol_to_target: bool = True  # True = going to target, False = returning to start
     tail_target_id: Optional[str] = None  # ID of drone being tailed
     tail_distance: float = 80.0  # Desired distance to maintain from target
+    intercept_target_id: Optional[str] = None  # ID of enemy drone being intercepted
+    intercept_start_x: Optional[float] = None  # Starting X position when intercept began
+    intercept_start_y: Optional[float] = None  # Starting Y position when intercept began
     base_id: str = "base_1"  # Which base this drone belongs to
     base_x: float = 0.0  # Home base X coordinate
     base_y: float = 0.0  # Home base Y coordinate
@@ -137,6 +140,13 @@ AVAILABLE_TASKS = {
         "parameters": {
             "friendly_drones": "list of string (friendly drone IDs)"
         }
+    },
+    "intercept": {
+        "description": "Intercept an enemy drone by calculating the best intercept route based on the enemy's movement pattern",
+        "parameters": {
+            "enemy_drone": "string (enemy drone ID)",
+            "friendly_drones": "list of string (friendly drone IDs)"
+        }
     }
 }
 
@@ -148,6 +158,9 @@ DRONE_SPEED = 200.0  # pixels per second (increased for faster movement)
 ENEMY_SPEED = 40.0  # pixels per second for enemy drones
 WORLD_WIDTH = 1000
 WORLD_HEIGHT = 1000
+GRID_COLS = 10  # A-J (10 columns)
+GRID_ROWS = 10  # 1-10 (10 rows)
+CELL_SIZE = WORLD_WIDTH / GRID_COLS  # 100 pixels per cell
 SIMULATION_DT = 0.02  # 20ms update interval (50Hz for smooth physics)
 DRONE_VISUAL_RADIUS = 13.0  # Visual radius of drones (increased for better visibility)
 DRONE_STROKE_WIDTH = 3.0  # Maximum stroke width (selected drones have strokeWidth=3, unselected=2)
@@ -255,6 +268,114 @@ def init_drones():
             pattern=pattern_info["pattern"],
             pattern_data=pattern_data
         )
+
+def predict_enemy_position(enemy_drone: Drone, t: float) -> tuple:
+    """Predict enemy drone position at time t based on its movement pattern."""
+    if enemy_drone.pattern_data is None:
+        return (enemy_drone.x, enemy_drone.y)
+    
+    if enemy_drone.pattern == "up_down":
+        center_y = enemy_drone.pattern_data["center_y"]
+        range_val = enemy_drone.pattern_data["range"]
+        direction = enemy_drone.pattern_data["direction"]
+        current_y = enemy_drone.y
+        
+        # Calculate distance traveled in time t
+        distance = direction * ENEMY_SPEED * t
+        new_y = current_y + distance
+        
+        # Handle bouncing at boundaries
+        while new_y > center_y + range_val or new_y < center_y - range_val:
+            if new_y > center_y + range_val:
+                # Hit top boundary, reverse
+                excess = new_y - (center_y + range_val)
+                new_y = center_y + range_val - excess
+                direction = -1
+            elif new_y < center_y - range_val:
+                # Hit bottom boundary, reverse
+                excess = (center_y - range_val) - new_y
+                new_y = center_y - range_val + excess
+                direction = 1
+        
+        return (enemy_drone.x, new_y)
+    
+    elif enemy_drone.pattern == "left_right":
+        center_x = enemy_drone.pattern_data["center_x"]
+        range_val = enemy_drone.pattern_data["range"]
+        direction = enemy_drone.pattern_data["direction"]
+        current_x = enemy_drone.x
+        
+        # Calculate distance traveled in time t
+        distance = direction * ENEMY_SPEED * t
+        new_x = current_x + distance
+        
+        # Handle bouncing at boundaries
+        while new_x > center_x + range_val or new_x < center_x - range_val:
+            if new_x > center_x + range_val:
+                # Hit right boundary, reverse
+                excess = new_x - (center_x + range_val)
+                new_x = center_x + range_val - excess
+                direction = -1
+            elif new_x < center_x - range_val:
+                # Hit left boundary, reverse
+                excess = (center_x - range_val) - new_x
+                new_x = center_x - range_val + excess
+                direction = 1
+        
+        return (new_x, enemy_drone.y)
+    
+    elif enemy_drone.pattern == "circular":
+        center_x = enemy_drone.pattern_data["center_x"]
+        center_y = enemy_drone.pattern_data["center_y"]
+        radius = enemy_drone.pattern_data["radius"]
+        angle = enemy_drone.pattern_data["angle"]
+        
+        # Calculate new angle
+        angular_speed = ENEMY_SPEED / radius
+        new_angle = angle + angular_speed * t
+        
+        # Calculate position on circle
+        new_x = center_x + radius * math.cos(new_angle)
+        new_y = center_y + radius * math.sin(new_angle)
+        
+        return (new_x, new_y)
+    
+    # Fallback to current position
+    return (enemy_drone.x, enemy_drone.y)
+
+def calculate_intercept_point(friendly_x: float, friendly_y: float, enemy_drone: Drone) -> tuple:
+    """Calculate the best intercept point for a friendly drone to reach an enemy drone.
+    Returns (intercept_x, intercept_y, intercept_time)"""
+    best_time = None
+    best_intercept = None
+    min_intercept_time = float('inf')
+    
+    # Search for intercept time between 0 and 30 seconds, in 0.1s steps
+    for t in range(0, 300):  # 0 to 30 seconds in 0.1s increments
+        t_sec = t / 10.0
+        enemy_x, enemy_y = predict_enemy_position(enemy_drone, t_sec)
+        
+        # Calculate distance to that point
+        dx = enemy_x - friendly_x
+        dy = enemy_y - friendly_y
+        distance = math.sqrt(dx * dx + dy * dy)
+        
+        # Calculate time needed for friendly drone to reach that point
+        time_needed = distance / DRONE_SPEED
+        
+        # Check if we can reach it in time (with small margin for approximation)
+        if time_needed <= t_sec + 0.1:  # Can reach it
+            if t_sec < min_intercept_time:
+                min_intercept_time = t_sec
+                best_time = t_sec
+                best_intercept = (enemy_x, enemy_y)
+    
+    # If we found a good intercept, use it
+    if best_intercept:
+        return (best_intercept[0], best_intercept[1], best_time)
+    
+    # Fallback: just head towards current enemy position
+    return (enemy_drone.x, enemy_drone.y, math.sqrt((enemy_drone.x - friendly_x)**2 + (enemy_drone.y - friendly_y)**2) / DRONE_SPEED)
 
 def update_enemy_pattern(drone: Drone, dt: float) -> Drone:
     """Update enemy drone position based on movement pattern."""
@@ -449,6 +570,116 @@ def update_drone(drone: Drone, dt: float, all_drones: List[Drone]) -> Drone:
                 drone.tail_target_id = None
                 drone.vx = 0.0
                 drone.vy = 0.0
+        
+        # Handle intercept mode: intercept enemy drone, then return to start if another drone succeeded
+        elif drone.mode == "intercept" and drone.intercept_target_id is not None:
+            # Find the target enemy drone
+            enemy_target = None
+            for d in all_drones:
+                if d.id == drone.intercept_target_id:
+                    enemy_target = d
+                    break
+            
+            if not enemy_target:
+                # Enemy not found - return to start
+                if drone.intercept_start_x is not None and drone.intercept_start_y is not None:
+                    drone.target_x = drone.intercept_start_x
+                    drone.target_y = drone.intercept_start_y
+                    drone.mode = "moving"
+                    drone.intercept_target_id = None
+                else:
+                    drone.mode = "idle"
+                    drone.intercept_target_id = None
+            else:
+                # Check if any friendly drone has already intercepted this enemy
+                # Check distance to enemy for all drones intercepting the same target
+                dx_to_enemy = enemy_target.x - drone.x
+                dy_to_enemy = enemy_target.y - drone.y
+                distance_to_enemy = math.sqrt(dx_to_enemy * dx_to_enemy + dy_to_enemy * dy_to_enemy)
+                
+                # Check if this drone has intercepted
+                if distance_to_enemy < DRONE_RADIUS * 2:
+                    # This drone intercepted! Return to start
+                    if drone.intercept_start_x is not None and drone.intercept_start_y is not None:
+                        drone.target_x = drone.intercept_start_x
+                        drone.target_y = drone.intercept_start_y
+                        drone.mode = "moving"
+                        drone.intercept_target_id = None
+                        drone.intercept_start_x = None
+                        drone.intercept_start_y = None
+                else:
+                    # Check if any other drone has intercepted this enemy
+                    enemy_intercepted = False
+                    for d in all_drones:
+                        if (d.team == "friendly" and 
+                            d.intercept_target_id == drone.intercept_target_id and
+                            d.id != drone.id):
+                            # Check if this other drone has reached the enemy
+                            dx_other = enemy_target.x - d.x
+                            dy_other = enemy_target.y - d.y
+                            distance_other = math.sqrt(dx_other * dx_other + dy_other * dy_other)
+                            if distance_other < DRONE_RADIUS * 2:  # Collision distance
+                                enemy_intercepted = True
+                                break
+                    
+                    if enemy_intercepted:
+                        # Another drone intercepted - return to start
+                        if drone.intercept_start_x is not None and drone.intercept_start_y is not None:
+                            drone.target_x = drone.intercept_start_x
+                            drone.target_y = drone.intercept_start_y
+                            drone.mode = "moving"
+                            drone.intercept_target_id = None
+                            drone.intercept_start_x = None
+                            drone.intercept_start_y = None
+                    else:
+                        # Still intercepting - recalculate intercept point periodically
+                        intercept_x, intercept_y, _ = calculate_intercept_point(
+                            drone.x, drone.y, enemy_target
+                        )
+                        
+                        # Update target if significantly different (to avoid constant recalculations)
+                        if drone.target_x is None or drone.target_y is None:
+                            drone.target_x = intercept_x
+                            drone.target_y = intercept_y
+                        else:
+                            dx_target = abs(drone.target_x - intercept_x)
+                            dy_target = abs(drone.target_y - intercept_y)
+                            if dx_target > 10 or dy_target > 10:  # Update if target changed significantly
+                                drone.target_x = intercept_x
+                                drone.target_y = intercept_y
+                        
+                        # Move toward intercept point (same as moving mode)
+                        if drone.target_x is not None and drone.target_y is not None:
+                            dx = drone.target_x - drone.x
+                            dy = drone.target_y - drone.y
+                            distance = math.sqrt(dx * dx + dy * dy)
+                            
+                            if distance < 5.0:  # Close enough to intercept point
+                                # Reached intercept point, but enemy might have moved - recalculate
+                                intercept_x, intercept_y, _ = calculate_intercept_point(
+                                    drone.x, drone.y, enemy_target
+                                )
+                                drone.target_x = intercept_x
+                                drone.target_y = intercept_y
+                            else:
+                                # Move toward intercept point
+                                if distance > 0:
+                                    direction_x = dx / distance
+                                    direction_y = dy / distance
+                                else:
+                                    direction_x = 0
+                                    direction_y = 0
+                                
+                                drone.vx = direction_x * DRONE_SPEED
+                                drone.vy = direction_y * DRONE_SPEED
+                                
+                                # Update position
+                                drone.x += drone.vx * dt
+                                drone.y += drone.vy * dt
+                                
+                                # Clamp to world bounds
+                                drone.x = max(0, min(WORLD_WIDTH, drone.x))
+                                drone.y = max(0, min(WORLD_HEIGHT, drone.y))
         
         # Handle patrol mode: go back and forth between start and target positions
         elif drone.mode == "patrol" and drone.patrol_start_x is not None and drone.patrol_target_x is not None:
@@ -755,8 +986,8 @@ def tail_task(enemy_drone: str, friendly_drones: List[str] = None, distance: flo
     return result
 
 def patrol_task(locations: List[Dict[str, float]] = None, friendly_drones: List[str] = None):
-    """Patrol task - sets drones to patrol between locations."""
-    if locations is None or len(locations) < 2:
+    """Patrol task - sets drones to patrol between exactly 2 locations."""
+    if locations is None or len(locations) != 2:
         result = {
             "task_name": "patrol",
             "parameters": {
@@ -764,7 +995,7 @@ def patrol_task(locations: List[Dict[str, float]] = None, friendly_drones: List[
                 "friendly_drones": friendly_drones or []
             },
             "success": False,
-            "message": "Patrol requires at least 2 locations"
+            "message": "Patrol requires exactly 2 locations"
         }
         world["task_results"].append(result)
         return result
@@ -786,7 +1017,8 @@ def patrol_task(locations: List[Dict[str, float]] = None, friendly_drones: List[
                 drone.patrol_start_y = start_loc.get("y", drone.y)
                 drone.patrol_target_x = target_loc.get("x", drone.x)
                 drone.patrol_target_y = target_loc.get("y", drone.y)
-                drone.patrol_to_target = True
+                # Start by going to the first location (start), then to the second (target)
+                drone.patrol_to_target = False  # False = go to start first, True = go to target
                 drone.vx = 0.0
                 drone.vy = 0.0
                 drone.command_id = None  # Patrol doesn't use command groups
@@ -865,12 +1097,81 @@ def return_to_base_task(friendly_drones: List[str] = None):
     world["task_results"].append(result)
     return result
 
+def intercept_task(enemy_drone: str, friendly_drones: List[str] = None):
+    """Intercept task - sets drones to intercept an enemy drone using predicted movement."""
+    if friendly_drones is None:
+        friendly_drones = []
+    
+    # Verify enemy drone exists
+    if enemy_drone not in world["drones"]:
+        result = {
+            "task_name": "intercept",
+            "parameters": {
+                "enemy_drone": enemy_drone,
+                "friendly_drones": friendly_drones
+            },
+            "success": False,
+            "message": f"Enemy drone {enemy_drone} not found"
+        }
+        world["task_results"].append(result)
+        return result
+    
+    enemy = world["drones"][enemy_drone]
+    if enemy.team != "enemy":
+        result = {
+            "task_name": "intercept",
+            "parameters": {
+                "enemy_drone": enemy_drone,
+                "friendly_drones": friendly_drones
+            },
+            "success": False,
+            "message": f"Drone {enemy_drone} is not an enemy drone"
+        }
+        world["task_results"].append(result)
+        return result
+    
+    updated_count = 0
+    for drone_id in friendly_drones:
+        if drone_id in world["drones"]:
+            drone = world["drones"][drone_id]
+            if drone.team == "friendly" and drone_id != enemy_drone:
+                # Calculate intercept point
+                intercept_x, intercept_y, intercept_time = calculate_intercept_point(
+                    drone.x, drone.y, enemy
+                )
+                
+                # Store starting position for return
+                drone.intercept_start_x = drone.x
+                drone.intercept_start_y = drone.y
+                drone.intercept_target_id = enemy_drone
+                drone.mode = "intercept"
+                drone.target_x = intercept_x
+                drone.target_y = intercept_y
+                drone.vx = 0.0
+                drone.vy = 0.0
+                drone.command_id = None  # Intercept doesn't use command groups
+                world["drones"][drone_id] = drone
+                updated_count += 1
+    
+    result = {
+        "task_name": "intercept",
+        "parameters": {
+            "enemy_drone": enemy_drone,
+            "friendly_drones": friendly_drones
+        },
+        "success": True,
+        "updated_drones": updated_count
+    }
+    world["task_results"].append(result)
+    return result
+
 # Task function registry
 TASK_FUNCTIONS = {
     "tail": tail_task,
     "patrol": patrol_task,
     "hold": hold_task,
-    "return_to_base": return_to_base_task
+    "return_to_base": return_to_base_task,
+    "intercept": intercept_task
 }
 
 @app.get("/tasks")
@@ -1021,6 +1322,41 @@ async def send_command(command: Command):
         "target": {"x": command.target_x, "y": command.target_y}
     }
 
+def chess_notation_to_coords(notation: str) -> tuple:
+    """Convert chess notation (e.g., 'B4', 'A1', 'T20') to (x, y) coordinates.
+    
+    Args:
+        notation: Chess-style notation like 'B4' (letter + number)
+        
+    Returns:
+        Tuple of (x, y) coordinates in world space, or None if invalid
+    """
+    if not notation or len(notation) < 2:
+        return None
+    
+    # Extract letter and number
+    letter = notation[0].upper()
+    try:
+        number = int(notation[1:])
+    except ValueError:
+        return None
+    
+    # Convert letter to column index (A=0, B=1, ..., J=9)
+    if letter < 'A' or letter > 'J':
+        return None
+    col_index = ord(letter) - ord('A')
+    
+    # Convert number to row index (1=0, 2=1, ..., 10=9)
+    if number < 1 or number > GRID_ROWS:
+        return None
+    row_index = number - 1
+    
+    # Calculate center of cell
+    x = col_index * CELL_SIZE + CELL_SIZE / 2
+    y = row_index * CELL_SIZE + CELL_SIZE / 2
+    
+    return (x, y)
+
 def get_world_context() -> str:
     """Get current world state as context for LLM, including distance calculations."""
     friendly_drones = [d for d in world["drones"].values() if d.team == "friendly"]
@@ -1121,7 +1457,7 @@ def create_function_definitions() -> List[Dict]:
                                 },
                                 "required": ["x", "y"]
                             },
-                            "description": "List of locations to patrol between (at least 2 points)"
+                            "description": "EXACTLY 2 locations to patrol between. REQUIRED: Must contain exactly 2 location objects with x and y coordinates. If the user provides chess notation (e.g., 'B4', 'D7'), you MUST convert each one to x,y coordinates using: column_index = (letter ASCII - 65), row_index = (number - 1), x = column_index * 100 + 50, y = row_index * 100 + 50. Example: 'B4' → column_index=1, row_index=3 → x=150, y=350 → {{'x': 150, 'y': 350}}"
                         },
                         "friendly_drones": {
                             "type": "array",
@@ -1168,6 +1504,28 @@ def create_function_definitions() -> List[Dict]:
                     "required": ["friendly_drones"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "intercept",
+                "description": "Intercept an enemy drone by calculating the best intercept route based on the enemy's movement pattern. All drones will attempt to intercept, and once one succeeds, the others return to their starting positions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "enemy_drone": {
+                            "type": "string",
+                            "description": "The ID of the enemy drone to intercept (e.g., 'enemy_1')"
+                        },
+                        "friendly_drones": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of friendly drone IDs to use for intercepting. If the user says 'closest', use the distances_to_enemies data from the world context to find the drone(s) with the smallest distance value for the specified enemy_drone."
+                        }
+                    },
+                    "required": ["enemy_drone", "friendly_drones"]
+                }
+            }
         }
     ]
 
@@ -1198,8 +1556,49 @@ async def process_natural_language(command: NaturalLanguageCommand):
     # Create system prompt
     system_prompt = f"""You are a drone command assistant. You help users control drones using natural language.
 
+CRITICAL: YOU MUST CALL EXACTLY ONE FUNCTION EXACTLY ONCE. NEVER CALL MULTIPLE FUNCTIONS. NEVER CALL THE SAME FUNCTION MULTIPLE TIMES. DO NOT PROVIDE TEXT EXPLANATIONS. DO NOT EXPLAIN YOUR REASONING IN TEXT. IMMEDIATELY CALL THE APPROPRIATE FUNCTION WITH THE CORRECT PARAMETERS IN A SINGLE FUNCTION CALL.
+
 Current world state:
 {world_context}
+
+MAP GRID SYSTEM - COORDINATE CONVERSION:
+The map uses a chess-style coordinate system with letters A-J (10 columns) and numbers 1-10 (10 rows).
+Each cell is 100x100 pixels. The world is 1000x1000 pixels total.
+
+STEP-BY-STEP COORDINATE CONVERSION (CRITICAL - FOLLOW EXACTLY):
+To convert chess notation like "B4" to x,y coordinates, follow these steps:
+
+1. Extract the letter and number:
+   - "B4" → letter = "B", number = 4
+
+2. Convert letter to column index:
+   - A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9
+   - Formula: column_index = (ASCII code of letter) - 65
+   - Example: "B" = ASCII 66, so column_index = 66 - 65 = 1
+
+3. Convert number to row index:
+   - Number 1 = row 0, 2 = row 1, 3 = row 2, ..., 10 = row 9
+   - Formula: row_index = number - 1
+   - Example: 4 → row_index = 4 - 1 = 3
+
+4. Calculate x coordinate (center of cell):
+   - x = column_index * 100 + 50
+   - Example: column_index 1 → x = 1 * 100 + 50 = 150
+
+5. Calculate y coordinate (center of cell):
+   - y = row_index * 100 + 50
+   - Example: row_index 3 → y = 3 * 100 + 50 = 350
+
+COMPLETE EXAMPLES:
+- "A1": A=0, 1=0 → x=0*100+50=50, y=0*100+50=50 → {{"x": 50, "y": 50}}
+- "B4": B=1, 4=3 → x=1*100+50=150, y=3*100+50=350 → {{"x": 150, "y": 350}}
+- "D7": D=3, 7=6 → x=3*100+50=350, y=6*100+50=650 → {{"x": 350, "y": 650}}
+- "J10": J=9, 10=9 → x=9*100+50=950, y=9*100+50=950 → {{"x": 950, "y": 950}}
+
+When the user says coordinates like "Patrol B4 to D7", you MUST convert BOTH coordinates:
+- "B4" → {{"x": 150, "y": 350}}
+- "D7" → {{"x": 350, "y": 650}}
+Then use both in the locations array: [{{"x": 150, "y": 350}}, {{"x": 350, "y": 650}}]
 
 IMPORTANT: The world context includes a "closest_drones" object that PRE-CALCULATES all friendly drones sorted by distance for each enemy.
 To find the closest drone(s) to a specific enemy (e.g., "enemy_4"):
@@ -1212,48 +1611,85 @@ Example: If closest_drones["enemy_4"]["closest_drones_sorted"] = ["drone_12", "d
 then "drone_12" is closest, "drone_6" is second closest, "drone_9" is third closest, etc.
 
 Available functions:
-- tail(enemy_drone, friendly_drones, distance): Follow an enemy drone with one or more friendly drones
-- patrol(locations, friendly_drones): Patrol between locations with one or more friendly drones
+- tail(enemy_drone, friendly_drones): Follow an enemy drone with one or more friendly drones
+- patrol(locations, friendly_drones): Patrol between exactly 2 locations with one or more friendly drones. REQUIRES exactly 2 locations in the locations array.
 - hold(friendly_drones): Stop selected drones at their current positions
 - return_to_base(friendly_drones): Send selected drones back to their home bases
+- intercept(enemy_drone, friendly_drones): Intercept an enemy drone using calculated intercept routes based on the enemy's movement pattern
 
-CRITICAL RULES:
-1. ONLY call the function that matches what the user requested. If the user says "tail", ONLY call tail(). If the user says "patrol", ONLY call patrol(). If the user says "hold" or "stop", ONLY call hold(). If the user says "return to base" or "go home", ONLY call return_to_base(). Do NOT call multiple different functions.
-2. Call each function exactly ONCE with ALL drones in a single call.
-3. To find the closest drone(s):
+CRITICAL RULES - READ CAREFULLY:
+1. YOU MUST CALL EXACTLY ONE FUNCTION EXACTLY ONCE. NEVER CALL TWO OR MORE FUNCTIONS. NEVER CALL THE SAME FUNCTION TWICE.
+2. NEVER RESPOND WITH TEXT ONLY. ALWAYS USE EXACTLY ONE TOOL CALL.
+3. ONLY call the function that matches what the user requested:
+   - If the user says "patrol" or "patrol from X to Y" → CALL patrol() EXACTLY ONCE
+   - If the user says "tail" → CALL tail() EXACTLY ONCE
+   - If the user says "hold" or "stop" → CALL hold() EXACTLY ONCE
+   - If the user says "return to base" or "go home" → CALL return_to_base() EXACTLY ONCE
+   - If the user says "intercept" → CALL intercept() EXACTLY ONCE
+   - DO NOT call multiple different functions. DO NOT call the same function multiple times.
+4. When calling a function, include ALL drones in a SINGLE call. DO NOT split into multiple calls.
+5. To find the closest drone(s):
    - Use the "closest_drones" object in the world context
    - For enemy "enemy_X", look at closest_drones["enemy_X"]["closest_drones_sorted"]
    - This is an array of drone IDs sorted by distance (closest first)
    - For 1 drone: use [0] (first element)
    - For 3 drones: use [0:3] (first 3 elements)
    - For N drones: use [0:N] (first N elements)
-4. DO NOT make multiple separate function calls. DO NOT call the function once per drone.
+6. DO NOT make multiple separate function calls. DO NOT call the function once per drone. DO NOT call the same function twice.
+7. DO NOT EXPLAIN YOUR REASONING. DO NOT SHOW YOUR CALCULATIONS. JUST MAKE ONE SINGLE FUNCTION CALL.
 
-Step-by-step examples:
+Step-by-step examples (DO NOT EXPLAIN - JUST CALL THE FUNCTION):
 
 Example 1: "Tail enemy drone 4 with my closest drone"
-1. User wants to tail "enemy_4" with 1 closest drone
-2. Look at closest_drones["enemy_4"]["closest_drones_sorted"][0] in the world context
-3. This gives you the closest drone ID (e.g., "drone_12")
-4. Call: tail("enemy_4", ["drone_12"], 50.0)
+- Look at closest_drones["enemy_4"]["closest_drones_sorted"][0] → "drone_12"
+- CALL: tail({{"enemy_drone": "enemy_4", "friendly_drones": ["drone_12"]}})
 
 Example 2: "Tail enemy drone 4 with my 3 closest drones"
-1. User wants to tail "enemy_4" with 3 closest drones
-2. Look at closest_drones["enemy_4"]["closest_drones_sorted"][0:3] in the world context
-3. This gives you the 3 closest drone IDs (e.g., ["drone_12", "drone_6", "drone_9"])
-4. Call: tail("enemy_4", ["drone_12", "drone_6", "drone_9"], 50.0)
+- Look at closest_drones["enemy_4"]["closest_drones_sorted"][0:3] → ["drone_12", "drone_6", "drone_9"]
+- CALL: tail({{"enemy_drone": "enemy_4", "friendly_drones": ["drone_12", "drone_6", "drone_9"]}})
 
 Example 3: "Stop my closest 3 drones" or "Hold my closest 3 drones"
-1. User wants to stop/hold 3 drones
-2. If no enemy specified, you can use all friendly drones or ask for clarification
-3. Call: hold(["drone_1", "drone_2", "drone_3"])  (ONE call)
+- Use friendly_drones from world context (e.g., ["drone_1", "drone_2", "drone_3"])
+- CALL: hold({{"friendly_drones": ["drone_1", "drone_2", "drone_3"]}})
 
 Example 4: "Send my drones back to base" or "Return my drones to base"
-1. User wants to return drones to base
-2. Use all friendly drones or the ones mentioned
-3. Call: return_to_base(["drone_1", "drone_2", ...])  (ONE call with all selected drones)
+- Use all friendly_drones from world context
+- CALL: return_to_base({{"friendly_drones": ["drone_1", "drone_2", ...]}})
+
+Example 5: "Intercept enemy drone 4 with my closest drone"
+- Look at closest_drones["enemy_4"]["closest_drones_sorted"][0] → "drone_12"
+- CALL: intercept({{"enemy_drone": "enemy_4", "friendly_drones": ["drone_12"]}})
+
+Example 6: "Intercept enemy drone 4 with my 3 closest drones"
+- Look at closest_drones["enemy_4"]["closest_drones_sorted"][0:3] → ["drone_12", "drone_6", "drone_9"]
+- CALL: intercept({{"enemy_drone": "enemy_4", "friendly_drones": ["drone_12", "drone_6", "drone_9"]}})
+
+Example 7: "Patrol from B4 to D7" or "Patrol B4 D7"
+- Step 1: Convert "B4" to coordinates:
+  * Letter "B": ASCII 66, column_index = 66 - 65 = 1
+  * Number 4: row_index = 4 - 1 = 3
+  * x = 1 * 100 + 50 = 150
+  * y = 3 * 100 + 50 = 350
+  * Result: {{"x": 150, "y": 350}}
+- Step 2: Convert "D7" to coordinates:
+  * Letter "D": ASCII 68, column_index = 68 - 65 = 3
+  * Number 7: row_index = 7 - 1 = 6
+  * x = 3 * 100 + 50 = 350
+  * y = 6 * 100 + 50 = 650
+  * Result: {{"x": 350, "y": 650}}
+- CALL: patrol({{"locations": [{{"x": 150, "y": 350}}, {{"x": 350, "y": 650}}], "friendly_drones": ["drone_1"]}})
+
+Example 8: "Patrol A1 to J10"
+- "A1": A=0, 1=0 → x=50, y=50
+- "J10": J=9, 10=9 → x=950, y=950
+- CALL: patrol({{"locations": [{{"x": 50, "y": 50}}, {{"x": 950, "y": 950}}], "friendly_drones": ["drone_1"]}})
+
+IMPORTANT: Patrol REQUIRES exactly 2 locations. If the user only provides one location, you MUST ask for clarification or infer a second location based on context. However, it's better to require both points explicitly.
 
 Always use the exact drone IDs from closest_drones_sorted array. The array is pre-sorted - just take the first N elements!
+When converting chess notation to coordinates, remember: A-J (10 letters), 1-10 (10 numbers), cell size is 100 pixels, coordinates are center of cell (column * 100 + 50, row * 100 + 50).
+
+FINAL REMINDER: YOU MUST CALL EXACTLY ONE FUNCTION EXACTLY ONCE. NEVER TWO FUNCTIONS. NEVER THE SAME FUNCTION TWICE. DO NOT RESPOND WITH TEXT. DO NOT EXPLAIN. JUST MAKE ONE SINGLE FUNCTION CALL IMMEDIATELY.
 """
     
     try:
@@ -1278,50 +1714,55 @@ Always use the exact drone IDs from closest_drones_sorted array. The array is pr
         
         # Check if function was called
         if message.tool_calls:
-            results = []
-            for tool_call in message.tool_calls:
-                function_name = tool_call.function.name
-                try:
-                    function_args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as e:
-                    results.append({
-                        "success": False,
-                        "message": f"Failed to parse function arguments: {str(e)}"
-                    })
-                    continue
-                
-                # Execute the function
-                if function_name in TASK_FUNCTIONS:
-                    try:
-                        task_func = TASK_FUNCTIONS[function_name]
-                        result = task_func(**function_args)
-                        results.append({
-                            "success": True,
-                            "task_name": result["task_name"],
-                            "parameters": result["parameters"]
-                        })
-                    except Exception as e:
-                        results.append({
-                            "success": False,
-                            "message": f"Error executing {function_name}: {str(e)}"
-                        })
-                else:
-                    results.append({
-                        "success": False,
-                        "message": f"Unknown function: {function_name}"
-                    })
+            # CRITICAL: Only process the FIRST tool call if multiple are returned
+            # This ensures we only execute one function per command
+            if len(message.tool_calls) > 1:
+                print(f"Warning: LLM returned {len(message.tool_calls)} tool calls, but only processing the first one")
             
-            # Format tool calls for display
-            tool_calls_display = []
-            for i, tool_call in enumerate(message.tool_calls):
+            # Process only the first tool call
+            tool_call = message.tool_calls[0]
+            function_name = tool_call.function.name
+            results = []
+            
+            try:
+                function_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as e:
+                return {
+                    "success": False,
+                    "message": f"Failed to parse function arguments: {str(e)}"
+                }
+            
+            # Execute the function
+            if function_name in TASK_FUNCTIONS:
                 try:
-                    function_args = json.loads(tool_call.function.arguments)
-                    tool_calls_display.append({
-                        "function": tool_call.function.name,
-                        "arguments": function_args
+                    task_func = TASK_FUNCTIONS[function_name]
+                    result = task_func(**function_args)
+                    results.append({
+                        "success": True,
+                        "task_name": result["task_name"],
+                        "parameters": result["parameters"]
                     })
-                except:
-                    pass
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "message": f"Error executing {function_name}: {str(e)}"
+                    }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Unknown function: {function_name}"
+                }
+            
+            # Format tool call for display (only the first one)
+            tool_calls_display = []
+            try:
+                function_args = json.loads(tool_call.function.arguments)
+                tool_calls_display.append({
+                    "function": tool_call.function.name,
+                    "arguments": function_args
+                })
+            except:
+                pass
             
             return {
                 "success": True,

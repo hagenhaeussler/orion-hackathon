@@ -17,10 +17,16 @@ function App() {
   const svgRef = useRef(null)
   const worldWidth = 1000
   const worldHeight = 1000
+  const GRID_COLS = 10  // A-J
+  const GRID_ROWS = 10  // 1-10
+  const CELL_SIZE = worldWidth / GRID_COLS  // 100 pixels per cell
+  const LABEL_OFFSET = 30  // Space for labels outside the grid
   
   // Mode state
-  const [patrolMode, setPatrolMode] = useState(false)  // Track if waiting for patrol target click
+  const [patrolMode, setPatrolMode] = useState(false)  // Track if waiting for patrol target clicks
+  const [patrolPoints, setPatrolPoints] = useState([])  // Track patrol points (should be 2)
   const [tailMode, setTailMode] = useState(false)  // Track if waiting for enemy drone selection
+  const [interceptMode, setInterceptMode] = useState(false)  // Track if waiting for enemy drone selection for intercept
   
   // Time control state
   const [isPaused, setIsPaused] = useState(false)
@@ -41,6 +47,12 @@ function App() {
   const [nlCommand, setNlCommand] = useState("")
   const [nlOutputs, setNlOutputs] = useState([])  // Store all parsed command outputs
   const [taskResults, setTaskResults] = useState([])
+  
+  // Voice recording state
+  const [isRecording, setIsRecording] = useState(false)
+  const recognitionRef = useRef(null)
+  const transcriptBufferRef = useRef('')
+  const isRecordingRef = useRef(false)
   
   // Format tool call as Python function call
   const formatPythonCall = (toolCall) => {
@@ -153,30 +165,34 @@ function App() {
     try {
       // Check if we're in patrol mode
       if (patrolMode) {
-        // Send patrol command
-        const firstDrone = drones.find(d => selectedDrones.has(d.id))
-        const response = await fetch(`${API_BASE}/task/execute`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            task_name: "patrol",
-            drone_ids: Array.from(selectedDrones),
-            parameters: {
-              friendly_drones: Array.from(selectedDrones),
-              locations: [
-                { x: firstDrone?.x || worldPos.x, y: firstDrone?.y || worldPos.y },
-                { x: worldPos.x, y: worldPos.y }
-              ]
-            }
+        // Add this point to patrol points
+        const newPoints = [...patrolPoints, { x: worldPos.x, y: worldPos.y }]
+        setPatrolPoints(newPoints)
+        
+        // If we have 2 points, send patrol command
+        if (newPoints.length === 2) {
+          const response = await fetch(`${API_BASE}/task/execute`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              task_name: "patrol",
+              drone_ids: Array.from(selectedDrones),
+              parameters: {
+                friendly_drones: Array.from(selectedDrones),
+                locations: newPoints
+              }
+            })
           })
-        })
-        
-        if (!response.ok) {
-          console.error('Failed to send patrol command')
+          
+          if (!response.ok) {
+            console.error('Failed to send patrol command')
+          }
+          
+          // Exit patrol mode and clear points
+          setPatrolMode(false)
+          setPatrolPoints([])
         }
-        
-        // Exit patrol mode
-        setPatrolMode(false)
+        // If we only have 1 point, wait for the second click
       } else {
         // Normal move command
         const response = await fetch(`${API_BASE}/command`, {
@@ -199,7 +215,7 @@ function App() {
       console.error('Error sending command:', error)
     }
     // Don't hide action panel when clicking on map - it's always visible now
-  }, [selectedDrones, screenToWorld, patrolMode, drones])
+  }, [selectedDrones, screenToWorld, patrolMode, patrolPoints, drones])
 
   // Handle click on drone (select, or add to selection with shift, or target for tail mode)
   const handleDroneClick = useCallback(async (e, droneId) => {
@@ -240,6 +256,38 @@ function App() {
       return
     }
     
+    // If in intercept mode and clicked on enemy drone, send intercept command
+    if (interceptMode && drone.team === 'enemy') {
+      if (selectedDrones.size === 0) {
+        setInterceptMode(false)
+        return
+      }
+      
+      try {
+        const response = await fetch(`${API_BASE}/task/execute`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            task_name: "intercept",
+            drone_ids: Array.from(selectedDrones),
+            parameters: {
+              enemy_drone: droneId,
+              friendly_drones: Array.from(selectedDrones)
+            }
+          })
+        })
+        
+        if (!response.ok) {
+          console.error('Failed to send intercept command')
+        }
+      } catch (error) {
+        console.error('Error sending intercept command:', error)
+      }
+      
+      setInterceptMode(false)
+      return
+    }
+    
     // Normal selection logic for friendly drones
     if (drone.team === 'friendly') {
       setSelectedDrones(prev => {
@@ -258,7 +306,7 @@ function App() {
         }
       })
     }
-  }, [tailMode, selectedDrones, drones])
+  }, [tailMode, interceptMode, selectedDrones, drones])
 
   // Handle task execution via UI
   const handleExecuteTask = useCallback(async () => {
@@ -290,6 +338,201 @@ function App() {
     }
   }, [selectedTask, taskMenuDrone, selectedDrones, taskParams])
 
+  // Initialize speech recognition
+  useEffect(() => {
+    // Check if browser supports speech recognition
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognition) {
+      console.warn('Speech recognition not supported in this browser')
+      return
+    }
+    
+    const recognition = new SpeechRecognition()
+    recognition.continuous = true  // Keep recording until stopped
+    recognition.interimResults = true  // Show interim results as user speaks
+    recognition.lang = 'en-US'  // Set language to English
+    
+    recognition.onresult = (event) => {
+      console.log('Speech recognition result:', event) // Debug log
+      
+      // Build complete transcript from ALL final results (they accumulate)
+      let completeFinalText = ''
+      let currentInterimText = ''
+      
+      // Process all results to build the complete transcript
+      for (let i = 0; i < event.results.length; i++) {
+        const result = event.results[i]
+        const transcript = result[0].transcript
+        
+        if (result.isFinal) {
+          // Add to complete final text
+          completeFinalText += transcript + ' '
+        } else {
+          // This is interim (only the last one matters)
+          currentInterimText = transcript
+        }
+      }
+      
+      // Update command with complete final text + current interim
+      if (completeFinalText.trim()) {
+        console.log('Complete final text:', completeFinalText.trim()) // Debug log
+        // Use only final results, ignore interim when we have final
+        setNlCommand(completeFinalText.trim())
+      } else if (currentInterimText.trim()) {
+        console.log('Interim text:', currentInterimText.trim()) // Debug log
+        // Show interim text with indicator
+        setNlCommand(currentInterimText.trim() + ' [listening...]')
+      }
+    }
+    
+    recognition.onerror = (event) => {
+      console.error('Speech recognition error:', event.error)
+      if (event.error === 'no-speech') {
+        // User didn't speak, just continue recording
+        return
+      } else if (event.error === 'aborted') {
+        // Recording was stopped manually, this is fine
+        isRecordingRef.current = false
+        setIsRecording(false)
+        return
+      } else if (event.error === 'not-allowed') {
+        // Microphone permission denied
+        alert('Microphone access was denied. Please allow microphone access in your browser settings and try again.')
+        isRecordingRef.current = false
+        setIsRecording(false)
+        return
+      } else {
+        // Other errors
+        let errorMessage = `Speech recognition error: ${event.error}`
+        if (event.error === 'network') {
+          errorMessage = 'Network error: Voice recognition requires an internet connection and access to speech recognition services.\n\nTroubleshooting:\n1. Check your internet connection\n2. Check browser settings → Privacy → Site Settings → Microphone (should be allowed)\n3. Try disabling ad blockers or privacy extensions temporarily\n4. Ensure you\'re using Chrome, Edge, or Safari (Firefox doesn\'t support Web Speech API)\n5. Check if a firewall or VPN is blocking the speech recognition service\n\nNote: The Web Speech API uses cloud-based services (Google/Apple) that require network access.'
+        } else if (event.error === 'service-not-allowed') {
+          errorMessage = 'Speech recognition service is not available. Please try again later.'
+        } else if (event.error === 'bad-grammar') {
+          errorMessage = 'Speech recognition grammar error. Please try again.'
+        } else if (event.error === 'audio-capture') {
+          errorMessage = 'Audio capture error. Please check your microphone and try again.'
+        }
+        alert(errorMessage)
+        isRecordingRef.current = false
+        setIsRecording(false)
+      }
+    }
+    
+    recognition.onend = () => {
+      console.log('Speech recognition ended, isRecordingRef:', isRecordingRef.current) // Debug log
+      
+      // If we're still supposed to be recording, try to restart
+      if (isRecordingRef.current) {
+        // Recognition ended unexpectedly, try to restart if still recording
+        try {
+          console.log('Attempting to restart speech recognition...') // Debug log
+          recognition.start()
+        } catch (e) {
+          console.error('Could not restart speech recognition:', e) // Debug log
+          // Can't restart, stop recording
+          isRecordingRef.current = false
+          setIsRecording(false)
+        }
+      } else {
+        // Recording was stopped intentionally, make sure we captured all results
+        console.log('Recording stopped intentionally') // Debug log
+      }
+    }
+    
+    recognitionRef.current = recognition
+    
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop()
+      }
+    }
+  }, [])
+  
+  // Check internet connectivity
+  const checkInternetConnection = useCallback(async () => {
+    try {
+      // Try to fetch a small resource to check connectivity
+      const response = await fetch('https://www.google.com/favicon.ico', { 
+        method: 'HEAD',
+        mode: 'no-cors',
+        cache: 'no-cache'
+      })
+      return true
+    } catch (error) {
+      return false
+    }
+  }, [])
+
+  // Request microphone permission
+  const requestMicrophonePermission = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      // Stop the stream immediately - we just needed permission
+      stream.getTracks().forEach(track => track.stop())
+      return true
+    } catch (error) {
+      console.error('Microphone permission denied:', error)
+      return false
+    }
+  }, [])
+
+  // Toggle voice recording
+  const toggleRecording = useCallback(async () => {
+    if (!recognitionRef.current) {
+      alert('Speech recognition is not supported in your browser. Please use Chrome, Edge, or Safari.')
+      return
+    }
+    
+    if (isRecordingRef.current) {
+      // Stop recording
+      console.log('Stopping recording...') // Debug log
+      isRecordingRef.current = false
+      // Give a small delay to allow any final results to come through
+      setTimeout(() => {
+        recognitionRef.current.stop()
+        setIsRecording(false)
+        // Clean up any remaining [listening...] indicator
+        setNlCommand(prev => prev.replace(/\s*\[listening\.\.\.\]\s*$/, ''))
+        console.log('Recording stopped') // Debug log
+      }, 300)  // Increased delay to allow final results
+    } else {
+      // Check basic online status (but don't block - let the API handle network errors)
+      if (!navigator.onLine) {
+        alert('You appear to be offline. Voice recognition requires an internet connection. The Web Speech API uses cloud-based speech recognition services.')
+        return
+      }
+      
+      // Request microphone permission first
+      const hasPermission = await requestMicrophonePermission()
+      if (!hasPermission) {
+        alert('Microphone permission is required for voice commands. Please allow microphone access and try again.')
+        return
+      }
+      
+      // Start recording
+      transcriptBufferRef.current = ''  // Clear buffer before starting
+      isRecordingRef.current = true
+      try {
+        recognitionRef.current.start()
+        setIsRecording(true)
+      } catch (error) {
+        console.error('Error starting speech recognition:', error)
+        isRecordingRef.current = false
+        setIsRecording(false)
+        
+        // Provide helpful error messages
+        if (error.name === 'NotAllowedError' || error.message?.includes('not-allowed')) {
+          alert('Microphone access was denied. Please allow microphone access in your browser settings and try again.')
+        } else if (error.name === 'NotFoundError') {
+          alert('No microphone found. Please connect a microphone and try again.')
+        } else {
+          alert(`Error starting voice recording: ${error.message || error}`)
+        }
+      }
+    }
+  }, [requestMicrophonePermission])
+  
   // Handle natural language command
   const handleNlCommand = useCallback(async () => {
     if (!nlCommand.trim()) return
@@ -491,16 +734,23 @@ function App() {
     // Control panel stays visible - just executed the command
   }, [selectedDrones])
 
-  // Start patrol mode - wait for user to click target on map
+  // Start patrol mode - wait for user to click two points on map
   const startPatrolMode = useCallback(() => {
     if (selectedDrones.size === 0) return
     setPatrolMode(true)
+    setPatrolPoints([])  // Reset patrol points
   }, [selectedDrones])
 
   // Start tail mode - wait for user to click enemy drone
   const startTailMode = useCallback(() => {
     if (selectedDrones.size === 0) return
     setTailMode(true)
+  }, [selectedDrones])
+
+  // Start intercept mode - wait for user to click enemy drone
+  const startInterceptMode = useCallback(() => {
+    if (selectedDrones.size === 0) return
+    setInterceptMode(true)
   }, [selectedDrones])
 
   // Return selected drones to their bases
@@ -594,7 +844,9 @@ function App() {
         setIsPaused(false)
         setIsReversing(false)
         setPatrolMode(false)
+        setPatrolPoints([])
         setTailMode(false)
+        setInterceptMode(false)
         setNlOutputs([])  // Clear command history on reset
       } else {
         console.warn(data.message || 'Failed to reset simulation')
@@ -611,7 +863,9 @@ function App() {
         setSelectedDrones(new Set())  // Just uncheck all boxes
         setShowTaskMenu(false)
         setPatrolMode(false)  // Cancel patrol mode
+        setPatrolPoints([])  // Clear patrol points
         setTailMode(false)  // Cancel tail mode
+        setInterceptMode(false)  // Cancel intercept mode
       }
     }
     window.addEventListener('keydown', handleKeyDown)
@@ -700,8 +954,8 @@ function App() {
               title="Reset Simulation"
             >
               <svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                {/* Reset icon: solid circular refresh arrow to match other icons */}
-                <path d="M12 6V2l-4 4 4 4V8c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" fill="currentColor"/>
+                {/* Reset icon: circular arrow matching other button styles */}
+                <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" fill="currentColor"/>
               </svg>
             </button>
           </div>
@@ -721,26 +975,29 @@ function App() {
           <div className="chat-tab-content">
             <div className="chat-output">
               {nlOutputs.length > 0 ? (
-                nlOutputs.map((output, index) => (
-                  <div key={index} className="nl-output-item">
-                    <div className="nl-output-label">Command {index + 1}:</div>
-                    {output.error ? (
-                      <div className="nl-output-error">{output.error}</div>
-                    ) : output.tool_calls ? (
-                      <div className="nl-output-code">
-                        {output.tool_calls.map((toolCall, i) => (
-                          <div key={i}>{formatPythonCall(toolCall)}</div>
-                        ))}
-                      </div>
-                    ) : output.results ? (
-                      <div className="nl-output-code">
-                        {output.results.map((result, i) => (
-                          <div key={i}>{JSON.stringify(result)}</div>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                ))
+                [...nlOutputs].reverse().map((output, index) => {
+                  const originalIndex = nlOutputs.length - 1 - index
+                  return (
+                    <div key={originalIndex} className="nl-output-item">
+                      <div className="nl-output-label">Command {nlOutputs.length - index}:</div>
+                      {output.error ? (
+                        <div className="nl-output-error">{output.error}</div>
+                      ) : output.tool_calls ? (
+                        <div className="nl-output-code">
+                          {output.tool_calls.map((toolCall, i) => (
+                            <div key={i}>{formatPythonCall(toolCall)}</div>
+                          ))}
+                        </div>
+                      ) : output.results ? (
+                        <div className="nl-output-code">
+                          {output.results.map((result, i) => (
+                            <div key={i}>{JSON.stringify(result)}</div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  )
+                })
               ) : (
                 <div className="nl-output-placeholder">
                   Enter a natural language command below to see the parsed commands here.
@@ -748,17 +1005,40 @@ function App() {
               )}
             </div>
             <div className="chat-input-container">
-              <input
-                type="text"
+              <textarea
                 value={nlCommand}
                 onChange={(e) => setNlCommand(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && handleNlCommand()}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    handleNlCommand()
+                  }
+                }}
                 placeholder="e.g., 'Tail enemy drone 1 with my three closest drones'"
                 className="chat-input"
+                rows={3}
               />
-              <button onClick={handleNlCommand} className="chat-send-button">
-                Send
-              </button>
+              <div className="chat-buttons">
+                <button 
+                  onClick={toggleRecording} 
+                  className={`chat-mic-button ${isRecording ? 'recording' : ''}`}
+                  title={isRecording ? 'Stop recording' : 'Start voice recording'}
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path 
+                      d="M12 1C10.34 1 9 2.34 9 4V11C9 12.66 10.34 14 12 14C13.66 14 15 12.66 15 11V4C15 2.34 13.66 1 12 1Z" 
+                      fill={isRecording ? "#ff4444" : "currentColor"}
+                    />
+                    <path 
+                      d="M19 10V11C19 14.53 16.39 17.44 13 17.93V21H11V17.93C7.61 17.44 5 14.53 5 11V10H7V11C7 13.76 9.24 16 12 16C14.76 16 17 13.76 17 11V10H19Z" 
+                      fill="currentColor"
+                    />
+                  </svg>
+                </button>
+                <button onClick={handleNlCommand} className="chat-send-button">
+                  Send
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -767,19 +1047,60 @@ function App() {
         <div className="map-container" onContextMenu={handleMapContextMenu}>
         <svg
           ref={svgRef}
-          viewBox={`0 0 ${worldWidth} ${worldHeight}`}
+          viewBox={`-${LABEL_OFFSET} -${LABEL_OFFSET} ${worldWidth + LABEL_OFFSET} ${worldHeight + LABEL_OFFSET}`}
           className="map"
           onClick={handleMapClick}
           onMouseDown={handleMouseDown}
         >
           {/* Grid background */}
           <defs>
-            <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
-              <path d="M 50 0 L 0 0 0 50" fill="none" stroke="#333" strokeWidth="1"/>
+            <pattern id="grid" width="100" height="100" patternUnits="userSpaceOnUse">
+              <path d="M 100 0 L 0 0 0 100" fill="none" stroke="#333" strokeWidth="1"/>
             </pattern>
           </defs>
           <rect width={worldWidth} height={worldHeight} fill="#0a0a0a" />
           <rect width={worldWidth} height={worldHeight} fill="url(#grid)" />
+          
+          {/* Chess-style grid labels - positioned outside the grid */}
+          <g className="grid-labels">
+            {/* Letters across the top (A-J) - above the grid */}
+            {Array.from({ length: GRID_COLS }, (_, i) => {
+              const letter = String.fromCharCode(65 + i) // A=65, B=66, etc.
+              return (
+                <text
+                  key={`col-${i}`}
+                  x={i * CELL_SIZE + CELL_SIZE / 2}
+                  y={-10}
+                  textAnchor="middle"
+                  fill="#666"
+                  fontSize="14"
+                  fontWeight="bold"
+                  pointerEvents="none"
+                >
+                  {letter}
+                </text>
+              )
+            })}
+            
+            {/* Numbers down the left (1-10) - to the left of the grid */}
+            {Array.from({ length: GRID_ROWS }, (_, i) => {
+              const number = i + 1
+              return (
+                <text
+                  key={`row-${i}`}
+                  x={-15}
+                  y={i * CELL_SIZE + CELL_SIZE / 2 + 5}
+                  textAnchor="middle"
+                  fill="#666"
+                  fontSize="14"
+                  fontWeight="bold"
+                  pointerEvents="none"
+                >
+                  {number}
+                </text>
+              )
+            })}
+          </g>
           
           {/* Geographic Features - Background Terrain */}
           {/* Mountains */}
@@ -947,7 +1268,7 @@ function App() {
                 key={drone.id}
                 onClick={(e) => handleDroneClick(e, drone.id)}
                 onContextMenu={isFriendly ? (e) => handleDroneContextMenu(e, drone) : undefined}
-                style={{ cursor: (isFriendly || tailMode) ? 'pointer' : 'default' }}
+                style={{ cursor: (isFriendly || tailMode || interceptMode) ? 'pointer' : 'default' }}
               >
                 {/* Drone shape based on base_shape */}
                 {isFriendly && drone.base_shape === 'circle' && (
@@ -1011,14 +1332,14 @@ function App() {
                   {isFriendly ? drone.id.replace('drone_', '') : drone.id.replace('enemy_', '')}
                 </text>
                 {/* Target indicator (only for friendly drones) */}
-                {isFriendly && drone.mode === "moving" && drone.target_x !== null && drone.target_y !== null && (
+                {isFriendly && (drone.mode === "moving" || drone.mode === "intercept") && drone.target_x !== null && drone.target_y !== null && (
                   <g>
                     <circle
                       cx={drone.target_x}
                       cy={drone.target_y}
                       r="5"
                       fill="none"
-                      stroke="#ffaa00"
+                      stroke={drone.mode === "intercept" ? "#ff8800" : "#ffaa00"}
                       strokeWidth="2"
                       strokeDasharray="3,3"
                     />
@@ -1027,7 +1348,7 @@ function App() {
                       y1={drone.y}
                       x2={drone.target_x}
                       y2={drone.target_y}
-                      stroke="#ffaa00"
+                      stroke={drone.mode === "intercept" ? "#ff8800" : "#ffaa00"}
                       strokeWidth="1"
                       strokeDasharray="2,2"
                       opacity="0.5"
@@ -1142,6 +1463,16 @@ function App() {
               <span>Tail Enemy</span>
             </div>
 
+            <div className="action-item" onClick={startInterceptMode} role="button" tabIndex={0}>
+              <svg width="20" height="20" viewBox="0 0 24 24" className="command-icon" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="8" cy="12" r="3" fill="none" stroke="#888" strokeWidth="1.5"/>
+                <circle cx="16" cy="12" r="3" fill="none" stroke="#888" strokeWidth="1.5"/>
+                <line x1="11" y1="12" x2="13" y2="12" stroke="#888" strokeWidth="1.5" strokeLinecap="round"/>
+                <path d="M11 10L13 12L11 14" fill="none" stroke="#888" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              <span>Intercept</span>
+            </div>
+
             <div className="action-item" onClick={returnToBase} role="button" tabIndex={0}>
               <svg width="20" height="20" viewBox="0 0 24 24" className="command-icon" xmlns="http://www.w3.org/2000/svg">
                 <path d="M12 3L2 12h3v8h6v-6h2v6h6v-8h3L12 3z" fill="#888" stroke="#888" strokeWidth="1"/>
@@ -1187,9 +1518,13 @@ function App() {
       <div className="bottom-bar">
         <div className="instructions">
           {patrolMode ? (
-            <p style={{ color: '#00ff88', fontWeight: 'bold' }}>🎯 PATROL MODE: Click on map to set patrol target point</p>
+            <p style={{ color: '#00ff88', fontWeight: 'bold' }}>
+              🎯 PATROL MODE: Click on map to set patrol points ({patrolPoints.length}/2)
+            </p>
           ) : tailMode ? (
             <p style={{ color: '#ff4444', fontWeight: 'bold' }}>👁️ TAIL MODE: Click on an enemy drone to tail</p>
+          ) : interceptMode ? (
+            <p style={{ color: '#ff8800', fontWeight: 'bold' }}>⚡ INTERCEPT MODE: Click on an enemy drone to intercept</p>
           ) : (
             <p>Click drone to select • Drag box to select multiple • Click map to move selected drones • Use Commands panel or Control panel to issue orders • ESC to deselect</p>
           )}
