@@ -139,7 +139,24 @@ def start_servers():
             while True:
                 for proc in processes:
                     if proc.poll() is not None:
-                        print(f"\nProcess exited with code {proc.returncode}")
+                        # Process exited - show error output if it failed
+                        if proc.returncode != 0:
+                            print(f"\n❌ Process exited with code {proc.returncode}")
+                            # Read and print any error output from stdout
+                            if proc.stdout:
+                                try:
+                                    # Read remaining output (non-blocking)
+                                    output_lines = []
+                                    while True:
+                                        line = proc.stdout.readline()
+                                        if not line:
+                                            break
+                                        output_lines.append(line)
+                                    if output_lines:
+                                        print("Error output:")
+                                        print("".join(output_lines))
+                                except:
+                                    pass
                         raise KeyboardInterrupt
                 time.sleep(0.1)
         except KeyboardInterrupt:
